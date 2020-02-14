@@ -124,6 +124,11 @@ impl<N: Fsm, C: Fsm> Batch<N, C> {
     /// Only when channel length is larger than `checked_len` will trigger
     /// further notification. This function may fail if channel length is
     /// larger than the given value before FSM is released.
+    /// Yuanguo: release the fsm from this batch and put it back to mailbox;
+    ///     but if mailbox.len() > checked_len, which indicates that there're
+    ///     new messages sent to the fsm; in this case, don't release the fsm
+    ///     (take it from the mailbox and push into this batch again), so we
+    ///     can handle those new message.
     pub fn release(&mut self, index: usize, checked_len: usize) {
         let mut fsm = self.normals.swap_remove(index);
         let mailbox = fsm.take_mailbox().unwrap();
@@ -148,6 +153,10 @@ impl<N: Fsm, C: Fsm> Batch<N, C> {
     /// This method should only be called when the FSM is stopped.
     /// If there are still messages in channel, the FSM is untouched and
     /// the function will return false to let caller to keep polling.
+    /// Yuanguo: similar to release function; but don't release the fsm
+    ///     if there is any messages in mailbox (mailbox is not empty),
+    ///     because we have to handle those messages before the fsm is
+    ///     removed;
     pub fn remove(&mut self, index: usize) {
         let mut fsm = self.normals.swap_remove(index);
         let mailbox = fsm.take_mailbox().unwrap();
