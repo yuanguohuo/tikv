@@ -296,6 +296,12 @@ impl<C: ProposalRouter> LocalReader<C> {
             true,  /* we need snapshot time */
         );
 
+        //Yuanguo: Store (crate::raftstore::store::fsm::store::StoreMeta) keeps some
+        //  readers (pub readers: HashMap<u64, ReadDelegate>), and the LocalReader
+        //  keeps a subset (cache) of those readers in delegates.
+        //  1. if 'self.pre_propose_raft_command()' found one in the cache, use it;
+        //  2. else, find from store_meta.readers and put into cache, go back to 1;
+        //  3. if none was found, redirect;
         loop {
             match self.pre_propose_raft_command(&cmd.request) {
                 Ok(Some(delegate)) => {
