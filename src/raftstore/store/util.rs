@@ -251,6 +251,9 @@ pub fn check_store_id(req: &RaftCmdRequest, store_id: u64) -> Result<()> {
 #[inline]
 pub fn check_term(req: &RaftCmdRequest, term: u64) -> Result<()> {
     let header = req.get_header();
+    //Yuanguo:
+    //     1. request has no term: request does not care about term?;
+    //     2. request term >= delegate term - 1: which indicates the request is not outdated;
     if header.get_term() == 0 || term <= header.get_term() + 1 {
         Ok(())
     } else {

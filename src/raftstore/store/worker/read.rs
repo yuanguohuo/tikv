@@ -204,6 +204,7 @@ impl<C: ProposalRouter> LocalReader<C> {
             }
         }
 
+        //Yuanguo: self.router.send has failed, now response with error;
         let mut resp = RaftCmdResponse::default();
         resp.mut_header().set_error(err);
         let read_resp = ReadResponse {
@@ -296,9 +297,9 @@ impl<C: ProposalRouter> LocalReader<C> {
             true,  /* we need snapshot time */
         );
 
-        //Yuanguo: Store (crate::raftstore::store::fsm::store::StoreMeta) keeps some
-        //  readers (pub readers: HashMap<u64, ReadDelegate>), and the LocalReader
-        //  keeps a subset (cache) of those readers in delegates.
+        //Yuanguo: Store (crate::raftstore::store::fsm::store::StoreMeta) maintains some
+        // readers (pub readers: HashMap<u64, ReadDelegate>) which are safe for local read,
+        // and the LocalReader keeps a subset (cache) of those readers in delegates.
         //  1. if 'self.pre_propose_raft_command()' found one in the cache, use it;
         //  2. else, find from store_meta.readers and put into cache, go back to 1;
         //  3. if none was found, redirect;

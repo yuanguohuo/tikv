@@ -2608,9 +2608,12 @@ impl RequestInspector for Peer {
     }
 
     fn inspect_lease(&mut self) -> LeaseState {
+        //Yuanguo: in_lease() == true indicates that this peer is definitely a leader (Role==Leader
+        // and check_quorum is enabled)
         if !self.raft_group.raft.in_lease() {
             return LeaseState::Suspect;
         }
+        //Yuanguo: we are sure this peer is a leader now, why do we need self.leader_lease below?
         // None means now.
         let state = self.leader_lease.inspect(None);
         if LeaseState::Expired == state {
