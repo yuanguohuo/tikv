@@ -19,7 +19,10 @@ use std::usize;
 
 use kvproto::configpb::{self, StatusCode};
 
-use configuration::{ConfigChange, ConfigManager, ConfigValue, Configuration, Result as CfgResult};
+use configuration::{
+    rollback_or, ConfigChange, ConfigManager, ConfigValue, Configuration, Result as CfgResult,
+    RollbackCollector,
+};
 use engine::rocks::{
     BlockBasedOptions, Cache, ColumnFamilyOptions, CompactionPriority, DBCompactionStyle,
     DBCompressionType, DBOptions, DBRateLimiterMode, DBRecoveryMode, LRUCacheOptions,
@@ -28,30 +31,33 @@ use engine::rocks::{
 use slog;
 
 use crate::import::Config as ImportConfig;
-use crate::raftstore::coprocessor::properties::MvccPropertiesCollectorFactory;
-use crate::raftstore::coprocessor::Config as CopConfig;
-use crate::raftstore::store::Config as RaftstoreConfig;
-use crate::raftstore::store::PdTask;
 use crate::server::gc_worker::GcConfig;
 use crate::server::lock_manager::Config as PessimisticTxnConfig;
 use crate::server::Config as ServerConfig;
 use crate::server::CONFIG_ROCKSDB_GAUGE;
 use crate::storage::config::{Config as StorageConfig, DEFAULT_DATA_DIR, DEFAULT_ROCKSDB_SUB_DIR};
+use encryption::EncryptionConfig;
 use engine::rocks::util::config::{self as rocks_config, BlobRunMode, CompressionType};
 use engine::rocks::util::{
-    db_exist, get_cf_handle, CFOptions, EventListener, FixedPrefixSliceTransform,
-    FixedSuffixSliceTransform, NoopSliceTransform,
+    db_exist, get_cf_handle, CFOptions, FixedPrefixSliceTransform, FixedSuffixSliceTransform,
+    NoopSliceTransform,
 };
-use engine::{CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE, DB};
+use engine::DB;
+use engine_rocks::properties::MvccPropertiesCollectorFactory;
 use engine_rocks::{
-    RangePropertiesCollectorFactory, DEFAULT_PROP_KEYS_INDEX_DISTANCE,
+    RangePropertiesCollectorFactory, RocksEventListener, DEFAULT_PROP_KEYS_INDEX_DISTANCE,
     DEFAULT_PROP_SIZE_INDEX_DISTANCE,
 };
+use engine_traits::{CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
 use keys::region_raft_prefix_len;
-use pd_client::{Config as PdConfig, ConfigClient};
-use tikv_util::config::{self, ReadableDuration, ReadableSize, GB, KB, MB};
+use pd_client::{Config as PdConfig, ConfigClient, Error as PdError};
+use raftstore::coprocessor::Config as CopConfig;
+use raftstore::store::Config as RaftstoreConfig;
+use raftstore::store::PdTask;
+use tikv_util::config::{self, ReadableDuration, ReadableSize, GB, MB};
 use tikv_util::future_pool;
 use tikv_util::security::SecurityConfig;
+use tikv_util::sys::sys_quota::SysQuota;
 use tikv_util::time::duration_to_sec;
 use tikv_util::worker::FutureScheduler;
 use tikv_util::Either;
@@ -61,11 +67,11 @@ const LOCKCF_MAX_MEM: usize = GB as usize;
 const RAFT_MIN_MEM: usize = 256 * MB as usize;
 const RAFT_MAX_MEM: usize = 2 * GB as usize;
 const LAST_CONFIG_FILE: &str = "last_tikv.toml";
+const TMP_CONFIG_FILE: &str = "tmp_tikv.toml";
 const MAX_BLOCK_SIZE: usize = 32 * MB as usize;
 
 fn memory_mb_for_cf(is_raft_db: bool, cf: &str) -> usize {
-    use sysinfo::SystemExt;
-    let total_mem = sysinfo::System::new().get_total_memory() * KB;
+    let total_mem = SysQuota::new().memory_limit_in_bytes();
     let (ratio, min, max) = match (is_raft_db, cf) {
         (true, CF_DEFAULT) => (0.02, RAFT_MIN_MEM, RAFT_MAX_MEM),
         (false, CF_DEFAULT) => (0.25, 0, usize::MAX),
@@ -103,6 +109,14 @@ pub struct TitanCfConfig {
     #[config(skip)]
     pub merge_small_file_threshold: ReadableSize,
     pub blob_run_mode: BlobRunMode,
+    #[config(skip)]
+    pub level_merge: bool,
+    #[config(skip)]
+    pub range_merge: bool,
+    #[config(skip)]
+    pub max_sorted_runs: i32,
+    #[config(skip)]
+    pub gc_merge_rewrite: bool,
 }
 
 impl Default for TitanCfConfig {
@@ -117,6 +131,10 @@ impl Default for TitanCfConfig {
             sample_ratio: 0.1,
             merge_small_file_threshold: ReadableSize::mb(8),
             blob_run_mode: BlobRunMode::Normal,
+            level_merge: false,
+            range_merge: true,
+            max_sorted_runs: 20,
+            gc_merge_rewrite: false,
         }
     }
 }
@@ -133,6 +151,10 @@ impl TitanCfConfig {
         opts.set_sample_ratio(self.sample_ratio);
         opts.set_merge_small_file_threshold(self.merge_small_file_threshold.0 as u64);
         opts.set_blob_run_mode(self.blob_run_mode.into());
+        opts.set_level_merge(self.level_merge);
+        opts.set_range_merge(self.range_merge);
+        opts.set_max_sorted_runs(self.max_sorted_runs);
+        opts.set_gc_merge_rewrite(self.gc_merge_rewrite);
         opts
     }
 }
@@ -142,7 +164,7 @@ fn get_background_job_limit(
     default_sub_compactions: u32,
     default_background_gc: i32,
 ) -> (i32, u32, i32) {
-    let cpu_num = sysinfo::get_logical_cores();
+    let cpu_num = SysQuota::new().cpu_cores_quota();
     // At the minimum, we should have two background jobs: one for flush and one for compaction.
     // Otherwise, the number of background jobs should not exceed cpu_num - 1.
     // By default, rocksdb assign (max_background_jobs / 4) threads dedicated for flush, and
@@ -167,22 +189,33 @@ macro_rules! cf_config {
         #[serde(default)]
         #[serde(rename_all = "kebab-case")]
         pub struct $name {
+            #[config(skip)]
             pub block_size: ReadableSize,
             pub block_cache_size: ReadableSize,
+            #[config(skip)]
             pub disable_block_cache: bool,
+            #[config(skip)]
             pub cache_index_and_filter_blocks: bool,
+            #[config(skip)]
             pub pin_l0_filter_and_index_blocks: bool,
+            #[config(skip)]
             pub use_bloom_filter: bool,
+            #[config(skip)]
             pub optimize_filters_for_hits: bool,
+            #[config(skip)]
             pub whole_key_filtering: bool,
+            #[config(skip)]
             pub bloom_filter_bits_per_key: i32,
+            #[config(skip)]
             pub block_based_bloom_filter: bool,
+            #[config(skip)]
             pub read_amp_bytes_per_bit: u32,
             #[serde(with = "rocks_config::compression_type_level_serde")]
             #[config(skip)]
             pub compression_per_level: [DBCompressionType; 7],
             pub write_buffer_size: ReadableSize,
             pub max_write_buffer_number: i32,
+            #[config(skip)]
             pub min_write_buffer_number_to_merge: i32,
             pub max_bytes_for_level_base: ReadableSize,
             pub target_file_size_base: ReadableSize,
@@ -193,7 +226,9 @@ macro_rules! cf_config {
             #[serde(with = "rocks_config::compaction_pri_serde")]
             #[config(skip)]
             pub compaction_pri: CompactionPriority,
+            #[config(skip)]
             pub dynamic_level_bytes: bool,
+            #[config(skip)]
             pub num_levels: i32,
             pub max_bytes_for_level_multiplier: i32,
             #[serde(with = "rocks_config::compaction_style_serde")]
@@ -202,9 +237,13 @@ macro_rules! cf_config {
             pub disable_auto_compactions: bool,
             pub soft_pending_compaction_bytes_limit: ReadableSize,
             pub hard_pending_compaction_bytes_limit: ReadableSize,
+            #[config(skip)]
             pub force_consistency_checks: bool,
+            #[config(skip)]
             pub prop_size_index_distance: u64,
+            #[config(skip)]
             pub prop_keys_index_distance: u64,
+            #[config(skip)]
             pub enable_doubly_skiplist: bool,
             #[config(submodule)]
             pub titan: TitanCfConfig,
@@ -702,32 +741,51 @@ pub struct DbConfig {
     #[serde(with = "rocks_config::recovery_mode_serde")]
     #[config(skip)]
     pub wal_recovery_mode: DBRecoveryMode,
+    #[config(skip)]
     pub wal_dir: String,
+    #[config(skip)]
     pub wal_ttl_seconds: u64,
+    #[config(skip)]
     pub wal_size_limit: ReadableSize,
     pub max_total_wal_size: ReadableSize,
     pub max_background_jobs: i32,
+    #[config(skip)]
     pub max_manifest_file_size: ReadableSize,
+    #[config(skip)]
     pub create_if_missing: bool,
     pub max_open_files: i32,
+    #[config(skip)]
     pub enable_statistics: bool,
+    #[config(skip)]
     pub stats_dump_period: ReadableDuration,
     pub compaction_readahead_size: ReadableSize,
+    #[config(skip)]
     pub info_log_max_size: ReadableSize,
+    #[config(skip)]
     pub info_log_roll_time: ReadableDuration,
+    #[config(skip)]
     pub info_log_keep_log_file_num: u64,
+    #[config(skip)]
     pub info_log_dir: String,
+    #[config(skip)]
     pub rate_bytes_per_sec: ReadableSize,
     #[serde(with = "rocks_config::rate_limiter_mode_serde")]
     #[config(skip)]
     pub rate_limiter_mode: DBRateLimiterMode,
+    #[config(skip)]
     pub auto_tuned: bool,
     pub bytes_per_sync: ReadableSize,
     pub wal_bytes_per_sync: ReadableSize,
+    #[config(skip)]
     pub max_sub_compactions: u32,
     pub writable_file_max_buffer_size: ReadableSize,
+    #[config(skip)]
     pub use_direct_io_for_flush_and_compaction: bool,
+    #[config(skip)]
     pub enable_pipelined_write: bool,
+    #[config(skip)]
+    pub enable_multi_batch_write: bool,
+    #[config(skip)]
     pub enable_unordered_write: bool,
     #[config(submodule)]
     pub defaultcf: DefaultCfConfig,
@@ -773,6 +831,7 @@ impl Default for DbConfig {
             writable_file_max_buffer_size: ReadableSize::mb(1),
             use_direct_io_for_flush_and_compaction: false,
             enable_pipelined_write: true,
+            enable_multi_batch_write: true,
             enable_unordered_write: false,
             defaultcf: DefaultCfConfig::default(),
             writecf: WriteCfConfig::default(),
@@ -828,9 +887,13 @@ impl DbConfig {
         opts.set_use_direct_io_for_flush_and_compaction(
             self.use_direct_io_for_flush_and_compaction,
         );
-        opts.enable_pipelined_write(self.enable_pipelined_write);
+        opts.enable_pipelined_write(
+            (self.enable_pipelined_write || self.enable_multi_batch_write)
+                && !self.enable_unordered_write,
+        );
+        opts.enable_multi_batch_write(self.enable_multi_batch_write);
         opts.enable_unordered_write(self.enable_unordered_write);
-        opts.add_event_listener(EventListener::new("kv"));
+        opts.add_event_listener(RocksEventListener::new("kv"));
 
         if self.titan.enabled {
             opts.set_titandb_options(&self.titan.build_opts());
@@ -867,7 +930,7 @@ impl DbConfig {
             if self.titan.enabled {
                 return Err("RocksDB.unordered_write does not support Titan".into());
             }
-            if self.enable_pipelined_write {
+            if self.enable_pipelined_write || self.enable_multi_batch_write {
                 return Err("pipelined_write is not compatible with unordered_write".into());
             }
         }
@@ -956,26 +1019,42 @@ pub struct RaftDbConfig {
     #[serde(with = "rocks_config::recovery_mode_serde")]
     #[config(skip)]
     pub wal_recovery_mode: DBRecoveryMode,
+    #[config(skip)]
     pub wal_dir: String,
+    #[config(skip)]
     pub wal_ttl_seconds: u64,
+    #[config(skip)]
     pub wal_size_limit: ReadableSize,
     pub max_total_wal_size: ReadableSize,
     pub max_background_jobs: i32,
+    #[config(skip)]
     pub max_manifest_file_size: ReadableSize,
+    #[config(skip)]
     pub create_if_missing: bool,
     pub max_open_files: i32,
+    #[config(skip)]
     pub enable_statistics: bool,
+    #[config(skip)]
     pub stats_dump_period: ReadableDuration,
     pub compaction_readahead_size: ReadableSize,
+    #[config(skip)]
     pub info_log_max_size: ReadableSize,
+    #[config(skip)]
     pub info_log_roll_time: ReadableDuration,
+    #[config(skip)]
     pub info_log_keep_log_file_num: u64,
+    #[config(skip)]
     pub info_log_dir: String,
+    #[config(skip)]
     pub max_sub_compactions: u32,
     pub writable_file_max_buffer_size: ReadableSize,
+    #[config(skip)]
     pub use_direct_io_for_flush_and_compaction: bool,
+    #[config(skip)]
     pub enable_pipelined_write: bool,
+    #[config(skip)]
     pub enable_unordered_write: bool,
+    #[config(skip)]
     pub allow_concurrent_memtable_write: bool,
     pub bytes_per_sync: ReadableSize,
     pub wal_bytes_per_sync: ReadableSize,
@@ -1059,7 +1138,7 @@ impl RaftDbConfig {
         opts.enable_pipelined_write(self.enable_pipelined_write);
         opts.enable_unordered_write(self.enable_unordered_write);
         opts.allow_concurrent_memtable_write(self.allow_concurrent_memtable_write);
-        opts.add_event_listener(EventListener::new("raft"));
+        opts.add_event_listener(RocksEventListener::new("raft"));
         opts.set_bytes_per_sync(self.bytes_per_sync.0 as u64);
         opts.set_wal_bytes_per_sync(self.wal_bytes_per_sync.0 as u64);
         // TODO maybe create a new env for raft engine
@@ -1276,6 +1355,8 @@ pub mod log_level_serde {
 pub struct UnifiedReadPoolConfig {
     pub min_thread_count: usize,
     pub max_thread_count: usize,
+    pub stack_size: ReadableSize,
+    pub max_tasks_per_worker: usize,
     // FIXME: Add more configs when they are effective in yatp
 }
 
@@ -1293,6 +1374,16 @@ impl UnifiedReadPoolConfig {
                     .into(),
             );
         }
+        if self.stack_size.0 < ReadableSize::mb(2).0 {
+            return Err("readpool.unified.stack-size should be >= 2mb"
+                .to_string()
+                .into());
+        }
+        if self.max_tasks_per_worker <= 1 {
+            return Err("readpool.unified.max-tasks-per-worker should be > 1"
+                .to_string()
+                .into());
+        }
         Ok(())
     }
 }
@@ -1302,12 +1393,14 @@ const UNIFIED_READPOOL_MIN_CONCURRENCY: usize = 4;
 // FIXME: Use macros to generate it if yatp is used elsewhere besides readpool.
 impl Default for UnifiedReadPoolConfig {
     fn default() -> UnifiedReadPoolConfig {
-        let cpu_num = sysinfo::get_logical_cores();
+        let cpu_num = SysQuota::new().cpu_cores_quota();
         let mut concurrency = (cpu_num as f64 * 0.8) as usize;
         concurrency = cmp::max(UNIFIED_READPOOL_MIN_CONCURRENCY, concurrency);
         Self {
             min_thread_count: 1,
             max_thread_count: concurrency,
+            stack_size: ReadableSize::mb(DEFAULT_READPOOL_STACK_SIZE_MB),
+            max_tasks_per_worker: DEFAULT_READPOOL_MAX_TASKS_PER_WORKER,
         }
     }
 }
@@ -1321,6 +1414,8 @@ mod unified_read_pool_tests {
         let cfg = UnifiedReadPoolConfig {
             min_thread_count: 1,
             max_thread_count: 2,
+            stack_size: ReadableSize::mb(2),
+            max_tasks_per_worker: 2000,
         };
         assert!(cfg.validate().is_ok());
 
@@ -1333,6 +1428,19 @@ mod unified_read_pool_tests {
         let invalid_cfg = UnifiedReadPoolConfig {
             min_thread_count: 2,
             max_thread_count: 1,
+            ..cfg
+        };
+        assert!(invalid_cfg.validate().is_err());
+
+        let invalid_cfg = UnifiedReadPoolConfig {
+            stack_size: ReadableSize::mb(1),
+            ..cfg
+        };
+        assert!(invalid_cfg.validate().is_err());
+
+        let invalid_cfg = UnifiedReadPoolConfig {
+            max_tasks_per_worker: 1,
+            ..cfg
         };
         assert!(invalid_cfg.validate().is_err());
     }
@@ -1344,6 +1452,7 @@ macro_rules! readpool_config {
         #[serde(default)]
         #[serde(rename_all = "kebab-case")]
         pub struct $struct_name {
+            pub use_unified_pool: Option<bool>,
             pub high_concurrency: usize,
             pub normal_concurrency: usize,
             pub low_concurrency: usize,
@@ -1377,6 +1486,7 @@ macro_rules! readpool_config {
 
             pub fn default_for_test() -> Self {
                 Self {
+                    use_unified_pool: None,
                     high_concurrency: 2,
                     normal_concurrency: 2,
                     low_concurrency: 2,
@@ -1409,10 +1519,12 @@ macro_rules! readpool_config {
                     )
                     .into());
                 }
-                if self.stack_size.0 < ReadableSize::mb(2).0 {
-                    return Err(
-                        format!("readpool.{}.stack-size should be >= 2mb", $display_name).into(),
-                    );
+                if self.stack_size.0 < ReadableSize::mb(MIN_READPOOL_STACK_SIZE_MB).0 {
+                    return Err(format!(
+                        "readpool.{}.stack-size should be >= {}mb",
+                        $display_name, MIN_READPOOL_STACK_SIZE_MB
+                    )
+                    .into());
                 }
                 if self.max_tasks_per_worker_high <= 1 {
                     return Err(format!(
@@ -1500,19 +1612,21 @@ const DEFAULT_STORAGE_READPOOL_MAX_CONCURRENCY: usize = 8;
 // 0.001 * x secs to be actual started. A server-is-busy error will trigger 2 seconds
 // backoff. So when it needs to wait for more than 2 seconds, return error won't causse
 // larger latency.
-const DEFAULT_READPOOL_MAX_TASKS_PER_WORKER: usize = 2 as usize * 1000;
+const DEFAULT_READPOOL_MAX_TASKS_PER_WORKER: usize = 2 * 1000;
 
+const MIN_READPOOL_STACK_SIZE_MB: u64 = 2;
 const DEFAULT_READPOOL_STACK_SIZE_MB: u64 = 10;
 
 readpool_config!(StorageReadPoolConfig, storage_read_pool_test, "storage");
 
 impl Default for StorageReadPoolConfig {
     fn default() -> Self {
-        let cpu_num = sysinfo::get_logical_cores();
+        let cpu_num = SysQuota::new().cpu_cores_quota();
         let mut concurrency = (cpu_num as f64 * 0.5) as usize;
         concurrency = cmp::max(DEFAULT_STORAGE_READPOOL_MIN_CONCURRENCY, concurrency);
         concurrency = cmp::min(DEFAULT_STORAGE_READPOOL_MAX_CONCURRENCY, concurrency);
         Self {
+            use_unified_pool: None,
             high_concurrency: concurrency,
             normal_concurrency: concurrency,
             low_concurrency: concurrency,
@@ -1521,6 +1635,13 @@ impl Default for StorageReadPoolConfig {
             max_tasks_per_worker_low: DEFAULT_READPOOL_MAX_TASKS_PER_WORKER,
             stack_size: ReadableSize::mb(DEFAULT_READPOOL_STACK_SIZE_MB),
         }
+    }
+}
+
+impl StorageReadPoolConfig {
+    pub fn use_unified_pool(&self) -> bool {
+        // The storage module does not use the unified pool by default.
+        self.use_unified_pool.unwrap_or(false)
     }
 }
 
@@ -1534,10 +1655,11 @@ readpool_config!(
 
 impl Default for CoprReadPoolConfig {
     fn default() -> Self {
-        let cpu_num = sysinfo::get_logical_cores();
+        let cpu_num = SysQuota::new().cpu_cores_quota();
         let mut concurrency = (cpu_num as f64 * 0.8) as usize;
         concurrency = cmp::max(DEFAULT_COPROCESSOR_READPOOL_MIN_CONCURRENCY, concurrency);
         Self {
+            use_unified_pool: None,
             high_concurrency: concurrency,
             normal_concurrency: concurrency,
             low_concurrency: concurrency,
@@ -1549,36 +1671,36 @@ impl Default for CoprReadPoolConfig {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
+impl CoprReadPoolConfig {
+    pub fn use_unified_pool(&self) -> bool {
+        // The coprocessor module uses the unified pool unless it has customized configurations.
+        self.use_unified_pool
+            .unwrap_or_else(|| *self == Default::default())
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Default, PartialEq, Debug)]
 #[serde(default)]
 #[serde(rename_all = "kebab-case")]
 pub struct ReadPoolConfig {
-    pub unify_read_pool: bool,
     pub unified: UnifiedReadPoolConfig,
     pub storage: StorageReadPoolConfig,
     pub coprocessor: CoprReadPoolConfig,
 }
 
 impl ReadPoolConfig {
+    pub fn is_unified_pool_enabled(&self) -> bool {
+        self.storage.use_unified_pool() || self.coprocessor.use_unified_pool()
+    }
+
     pub fn validate(&self) -> Result<(), Box<dyn Error>> {
-        if self.unify_read_pool {
+        if self.is_unified_pool_enabled() {
             self.unified.validate()?;
         } else {
             self.storage.validate()?;
             self.coprocessor.validate()?;
         }
         Ok(())
-    }
-}
-
-impl Default for ReadPoolConfig {
-    fn default() -> ReadPoolConfig {
-        ReadPoolConfig {
-            unify_read_pool: false,
-            unified: Default::default(),
-            storage: Default::default(),
-            coprocessor: Default::default(),
-        }
     }
 }
 
@@ -1592,35 +1714,47 @@ mod readpool_tests {
         let unified = UnifiedReadPoolConfig {
             min_thread_count: 0,
             max_thread_count: 0,
+            stack_size: ReadableSize::mb(0),
+            max_tasks_per_worker: 0,
         };
         assert!(unified.validate().is_err());
-        let storage = StorageReadPoolConfig::default();
+        let storage = StorageReadPoolConfig {
+            use_unified_pool: Some(false),
+            ..Default::default()
+        };
         assert!(storage.validate().is_ok());
-        let coprocessor = CoprReadPoolConfig::default();
+        let coprocessor = CoprReadPoolConfig {
+            use_unified_pool: Some(false),
+            ..Default::default()
+        };
         assert!(coprocessor.validate().is_ok());
         let cfg = ReadPoolConfig {
-            unify_read_pool: false,
             unified,
             storage,
             coprocessor,
         };
+        assert!(!cfg.is_unified_pool_enabled());
         assert!(cfg.validate().is_ok());
 
         // Storage and coprocessor config must be valid when yatp is not used.
         let unified = UnifiedReadPoolConfig::default();
         assert!(unified.validate().is_ok());
         let storage = StorageReadPoolConfig {
+            use_unified_pool: Some(false),
             high_concurrency: 0,
             ..Default::default()
         };
         assert!(storage.validate().is_err());
-        let coprocessor = CoprReadPoolConfig::default();
+        let coprocessor = CoprReadPoolConfig {
+            use_unified_pool: Some(false),
+            ..Default::default()
+        };
         let invalid_cfg = ReadPoolConfig {
-            unify_read_pool: false,
             unified,
             storage,
             coprocessor,
         };
+        assert!(!invalid_cfg.is_unified_pool_enabled());
         assert!(invalid_cfg.validate().is_err());
     }
 
@@ -1630,6 +1764,7 @@ mod readpool_tests {
         let unified = UnifiedReadPoolConfig::default();
         assert!(unified.validate().is_ok());
         let storage = StorageReadPoolConfig {
+            use_unified_pool: Some(true),
             high_concurrency: 0,
             ..Default::default()
         };
@@ -1640,30 +1775,52 @@ mod readpool_tests {
         };
         assert!(coprocessor.validate().is_err());
         let cfg = ReadPoolConfig {
-            unify_read_pool: true,
             unified,
             storage,
             coprocessor,
         };
+        assert!(cfg.is_unified_pool_enabled());
         assert!(cfg.validate().is_ok());
 
         // Yatp config must be valid when yatp is used.
         let unified = UnifiedReadPoolConfig {
             min_thread_count: 0,
             max_thread_count: 0,
+            ..Default::default()
         };
         assert!(unified.validate().is_err());
-        let storage = StorageReadPoolConfig::default();
+        let storage = StorageReadPoolConfig {
+            use_unified_pool: Some(true),
+            ..Default::default()
+        };
         assert!(storage.validate().is_ok());
         let coprocessor = CoprReadPoolConfig::default();
         assert!(coprocessor.validate().is_ok());
         let cfg = ReadPoolConfig {
-            unify_read_pool: true,
             unified,
             storage,
             coprocessor,
         };
+        assert!(cfg.is_unified_pool_enabled());
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_is_unified() {
+        let storage = StorageReadPoolConfig::default();
+        assert!(!storage.use_unified_pool());
+        let coprocessor = CoprReadPoolConfig::default();
+        assert!(coprocessor.use_unified_pool());
+
+        let mut cfg = ReadPoolConfig {
+            storage,
+            coprocessor,
+            ..Default::default()
+        };
+        assert!(cfg.is_unified_pool_enabled());
+
+        cfg.coprocessor.use_unified_pool = Some(false);
+        assert!(!cfg.is_unified_pool_enabled());
     }
 }
 
@@ -1672,7 +1829,7 @@ mod readpool_tests {
 #[serde(rename_all = "kebab-case")]
 pub struct TiKvConfig {
     #[config(skip)]
-    pub dynamic_config: bool,
+    pub enable_dynamic_config: bool,
 
     #[config(skip)]
     #[serde(with = "log_level_serde")]
@@ -1680,6 +1837,12 @@ pub struct TiKvConfig {
 
     #[config(skip)]
     pub log_file: String,
+
+    #[config(skip)]
+    pub slow_log_file: String,
+
+    #[config(skip)]
+    pub slow_log_threshold: ReadableDuration,
 
     #[config(skip)]
     pub log_rotation_timespan: ReadableDuration,
@@ -1724,6 +1887,9 @@ pub struct TiKvConfig {
     pub security: SecurityConfig,
 
     #[config(skip)]
+    pub encryption: EncryptionConfig,
+
+    #[config(skip)]
     pub import: ImportConfig,
 
     #[config(submodule)]
@@ -1736,9 +1902,11 @@ pub struct TiKvConfig {
 impl Default for TiKvConfig {
     fn default() -> TiKvConfig {
         TiKvConfig {
-            dynamic_config: false,
+            enable_dynamic_config: true,
             log_level: slog::Level::Info,
             log_file: "".to_owned(),
+            slow_log_file: "".to_owned(),
+            slow_log_threshold: ReadableDuration::secs(1),
             log_rotation_timespan: ReadableDuration::hours(24),
             log_rotation_size: ReadableSize::mb(300),
             panic_when_unexpected_key_or_data: false,
@@ -1753,6 +1921,7 @@ impl Default for TiKvConfig {
             raftdb: RaftDbConfig::default(),
             storage: StorageConfig::default(),
             security: SecurityConfig::default(),
+            encryption: EncryptionConfig::default(),
             import: ImportConfig::default(),
             pessimistic_txn: PessimisticTxnConfig::default(),
             gc: GcConfig::default(),
@@ -1761,16 +1930,43 @@ impl Default for TiKvConfig {
 }
 
 impl TiKvConfig {
+    // TODO: change to validate(&self)
     pub fn validate(&mut self) -> Result<(), Box<dyn Error>> {
+        self.validate_or_rollback(None)
+    }
+
+    /// Validate the config, if encounter invalid config try to fallback to
+    /// the valid config. Caller should not rely on this method for validating
+    /// because some configs not implement rollback collector yet.
+    pub fn validate_with_rollback(&mut self, cfg: &TiKvConfig) -> ConfigChange {
+        let mut c = HashMap::new();
+        let rb_collector = RollbackCollector::new(cfg, &mut c);
+        if let Err(e) = self.validate_or_rollback(Some(rb_collector)) {
+            warn!("Invalid config"; "err" => ?e)
+        }
+        c
+    }
+
+    // If `rb_collector` is `Some`, when encounter some invalid config, instead of
+    // return an Error, a fallback from these invalid configs to the valid config
+    // will be collected and insert into `rb_collector`. For configs that not implement
+    // rollback collector yet, an `Err` will return if encounter invalid config
+    // TODO: implement rollback collector for more config
+    fn validate_or_rollback(
+        &mut self,
+        mut rb_collector: Option<RollbackCollector<TiKvConfig>>,
+    ) -> Result<(), Box<dyn Error>> {
         self.readpool.validate()?;
         self.storage.validate()?;
 
         self.raft_store.region_split_check_diff = self.coprocessor.region_split_size / 16;
-        self.raft_store.raftdb_path = if self.raft_store.raftdb_path.is_empty() {
-            config::canonicalize_sub_path(&self.storage.data_dir, "raft")?
-        } else {
-            config::canonicalize_path(&self.raft_store.raftdb_path)?
-        };
+
+        let default_raftdb_path = config::canonicalize_sub_path(&self.storage.data_dir, "raft")?;
+        if self.raft_store.raftdb_path.is_empty() {
+            self.raft_store.raftdb_path = default_raftdb_path;
+        } else if self.raft_store.raftdb_path != default_raftdb_path {
+            self.raft_store.raftdb_path = config::canonicalize_path(&self.raft_store.raftdb_path)?;
+        }
 
         let kv_db_path =
             config::canonicalize_sub_path(&self.storage.data_dir, DEFAULT_ROCKSDB_SUB_DIR)?;
@@ -1816,16 +2012,36 @@ impl TiKvConfig {
             .into());
         }
 
+        rollback_or!(
+            rb_collector,
+            raft_store,
+            |r| { self.raft_store.validate_or_rollback(r) },
+            self.raft_store.validate()?
+        );
+        rollback_or!(
+            rb_collector,
+            coprocessor,
+            |r| { self.coprocessor.validate_or_rollback(r) },
+            self.coprocessor.validate()?
+        );
+        rollback_or!(
+            rb_collector,
+            pessimistic_txn,
+            |r| { self.pessimistic_txn.validate_or_rollback(r) },
+            self.pessimistic_txn.validate()?
+        );
+        rollback_or!(
+            rb_collector,
+            gc,
+            |r| { self.gc.validate_or_rollback(r) },
+            self.gc.validate()?
+        );
         self.rocksdb.validate()?;
         self.raftdb.validate()?;
         self.server.validate()?;
-        self.raft_store.validate()?;
         self.pd.validate()?;
-        self.coprocessor.validate()?;
         self.security.validate()?;
         self.import.validate()?;
-        self.pessimistic_txn.validate()?;
-        self.gc.validate()?;
         Ok(())
     }
 
@@ -1871,7 +2087,7 @@ impl TiKvConfig {
                 "server.end-point-concurrency",
                 self.server.end_point_concurrency
             );
-            let concurrency = self.server.end_point_concurrency.unwrap();
+            let concurrency = self.server.end_point_concurrency.take().unwrap();
             self.readpool.coprocessor.high_concurrency = concurrency;
             self.readpool.coprocessor.normal_concurrency = concurrency;
             self.readpool.coprocessor.low_concurrency = concurrency;
@@ -1887,7 +2103,7 @@ impl TiKvConfig {
                 "server.end-point-stack-size",
                 self.server.end_point_stack_size
             );
-            self.readpool.coprocessor.stack_size = self.server.end_point_stack_size.unwrap();
+            self.readpool.coprocessor.stack_size = self.server.end_point_stack_size.take().unwrap();
         }
         if self.server.end_point_max_tasks.is_some() {
             warn!(
@@ -1899,11 +2115,7 @@ impl TiKvConfig {
             // new configuration using old values.
             self.server.end_point_max_tasks = None;
         }
-        if self.raft_store.clean_stale_peer_delay.as_secs() > 0 {
-            let delay_secs = self.raft_store.clean_stale_peer_delay.as_secs()
-                + self.server.end_point_request_max_handle_duration.as_secs();
-            self.raft_store.clean_stale_peer_delay = ReadableDuration::secs(delay_secs);
-        }
+
         // When shared block cache is enabled, if its capacity is set, it overrides individual
         // block cache sizes. Otherwise use the sum of block cache size of all column families
         // as the shared cache size.
@@ -2000,21 +2212,28 @@ impl TiKvConfig {
 pub fn check_critical_config(config: &TiKvConfig) -> Result<(), String> {
     // Check current critical configurations with last time, if there are some
     // changes, user must guarantee relevant works have been done.
-    let store_path = Path::new(&config.storage.data_dir);
-    let last_cfg_path = store_path.join(LAST_CONFIG_FILE);
-
-    if last_cfg_path.exists() {
-        let last_cfg = TiKvConfig::from_file(&last_cfg_path);
-        config.check_critical_cfg_with(&last_cfg)?;
+    if let Some(mut cfg) = get_last_config(&config.storage.data_dir) {
+        cfg.compatible_adjust();
+        let _ = cfg.validate();
+        config.check_critical_cfg_with(&cfg)?;
     }
-
     Ok(())
 }
 
-/// Persists critical config to `last_tikv.toml`
-pub fn persist_critical_config(config: &TiKvConfig) -> Result<(), String> {
+fn get_last_config(data_dir: &str) -> Option<TiKvConfig> {
+    let store_path = Path::new(data_dir);
+    let last_cfg_path = store_path.join(LAST_CONFIG_FILE);
+    if last_cfg_path.exists() {
+        return Some(TiKvConfig::from_file(&last_cfg_path));
+    }
+    None
+}
+
+/// Persists config to `last_tikv.toml`
+pub fn persist_config(config: &TiKvConfig) -> Result<(), String> {
     let store_path = Path::new(&config.storage.data_dir);
     let last_cfg_path = store_path.join(LAST_CONFIG_FILE);
+    let tmp_cfg_path = store_path.join(TMP_CONFIG_FILE);
 
     // Create parent directory if missing.
     if let Err(e) = fs::create_dir_all(&store_path) {
@@ -2025,10 +2244,20 @@ pub fn persist_critical_config(config: &TiKvConfig) -> Result<(), String> {
         ));
     }
 
-    // Persist current critical configurations to file.
-    if let Err(e) = config.write_to_file(&last_cfg_path) {
+    // Persist current configurations to temporary file.
+    if let Err(e) = config.write_to_file(&tmp_cfg_path) {
         return Err(format!(
-            "persist critical config to '{}' failed: {}",
+            "persist config to '{}' failed: {}",
+            tmp_cfg_path.to_str().unwrap(),
+            e
+        ));
+    }
+
+    // Rename temporary file to last config file.
+    if let Err(e) = fs::rename(&tmp_cfg_path, &last_cfg_path) {
+        return Err(format!(
+            "rename config file from '{}' to '{}' failed: {}",
+            tmp_cfg_path.to_str().unwrap(),
             last_cfg_path.to_str().unwrap(),
             e
         ));
@@ -2058,7 +2287,9 @@ fn to_config_entry(change: ConfigChange) -> CfgResult<Vec<configpb::ConfigEntry>
                 name = p;
             }
             if let ConfigValue::Module(change) = value {
-                entries.append(&mut helper(name, change)?);
+                if !change.is_empty() {
+                    entries.append(&mut helper(name, change)?);
+                }
             } else {
                 let mut e = configpb::ConfigEntry::default();
                 e.set_name(name);
@@ -2117,6 +2348,7 @@ pub enum Module {
     Raftdb,
     Storage,
     Security,
+    Encryption,
     Import,
     PessimisticTxn,
     Gc,
@@ -2136,6 +2368,7 @@ impl From<&str> for Module {
             "raftdb" => Module::Raftdb,
             "storage" => Module::Storage,
             "security" => Module::Security,
+            "encryption" => Module::Encryption,
             "import" => Module::Import,
             "pessimistic_txn" => Module::PessimisticTxn,
             "gc" => Module::Gc,
@@ -2152,14 +2385,16 @@ pub struct ConfigController {
     current: TiKvConfig,
     config_mgrs: HashMap<Module, Box<dyn ConfigManager>>,
     start_version: Option<configpb::Version>,
+    persist_update: bool,
 }
 
 impl ConfigController {
-    pub fn new(current: TiKvConfig, version: configpb::Version) -> Self {
+    pub fn new(current: TiKvConfig, version: configpb::Version, persist_update: bool) -> Self {
         ConfigController {
             current,
             config_mgrs: HashMap::new(),
             start_version: Some(version),
+            persist_update,
         }
     }
 
@@ -2170,13 +2405,23 @@ impl ConfigController {
         // Config from PD have not been checked, call `compatible_adjust()`
         // and `validate()` before use it
         incoming.compatible_adjust();
-        if incoming.validate().is_err() {
-            let diff = incoming.diff(&self.current);
-            return Ok(Either::Left(diff));
+        let rollback = incoming.validate_with_rollback(&self.current);
+        if !rollback.is_empty() {
+            return Ok(Either::Left(rollback));
         }
         let diff = self.current.diff(&incoming);
         if diff.is_empty() {
             return Ok(Either::Right(false));
+        } else {
+            // validate current config after apply diff, we can't just validate the
+            // incoming config because some configs are skip and incoming config not
+            // equal to current config + diff
+            let mut current = self.current.clone();
+            current.update(diff.clone());
+            let rollback = current.validate_with_rollback(&self.current);
+            if !rollback.is_empty() {
+                return Ok(Either::Left(rollback));
+            }
         }
         let mut to_update = HashMap::with_capacity(diff.len());
         for (name, change) in diff.into_iter() {
@@ -2199,6 +2444,11 @@ impl ConfigController {
         }
         debug!("all config change had been dispatched"; "change" => ?to_update);
         self.current.update(to_update);
+        if self.persist_update {
+            if let Err(e) = persist_config(&incoming) {
+                return Err(e.into());
+            }
+        }
         Ok(Either::Right(true))
     }
 
@@ -2229,7 +2479,7 @@ impl ConfigHandler {
         mut controller: ConfigController,
         scheduler: FutureScheduler<PdTask>,
     ) -> CfgResult<Self> {
-        if controller.get_current().dynamic_config {
+        if controller.get_current().enable_dynamic_config {
             if let Err(e) = scheduler.schedule(PdTask::RefreshConfig) {
                 return Err(format!("failed to schedule refresh config task: {:?}", e).into());
             }
@@ -2255,6 +2505,14 @@ impl ConfigHandler {
     }
 }
 
+#[derive(Debug)]
+pub enum CfgError {
+    Pd(PdError),
+    TomlDe(toml::de::Error),
+    TomlSer(toml::ser::Error),
+    Other(Box<dyn std::error::Error + Sync + Send>),
+}
+
 impl ConfigHandler {
     /// Register the local config to pd and get the latest
     /// version and config
@@ -2262,14 +2520,18 @@ impl ConfigHandler {
         id: String,
         cfg_client: Arc<impl ConfigClient>,
         local_config: TiKvConfig,
-    ) -> CfgResult<(configpb::Version, TiKvConfig)> {
-        let cfg = toml::to_string(&local_config.get_encoder())?;
+    ) -> Result<(configpb::Version, TiKvConfig), CfgError> {
+        let cfg = toml::to_string(&local_config.get_encoder()).map_err(CfgError::TomlSer)?;
         let version = configpb::Version::default();
-        let mut resp = cfg_client.register_config(id, version, cfg)?;
+        let mut resp = cfg_client
+            .register_config(id, version, cfg)
+            .map_err(CfgError::Pd)?;
         match resp.get_status().get_code() {
             StatusCode::Ok | StatusCode::WrongVersion => {
-                let mut incoming: TiKvConfig = toml::from_str(resp.get_config())?;
+                let mut incoming: TiKvConfig =
+                    toml::from_str(resp.get_config()).map_err(CfgError::TomlDe)?;
                 let mut version = resp.take_version();
+                incoming.compatible_adjust();
                 if let Err(e) = incoming.validate() {
                     warn!(
                         "config from pd is invalid, fallback to local config";
@@ -2277,12 +2539,15 @@ impl ConfigHandler {
                         "error" => ?e,
                     );
                     version = configpb::Version::default();
-                    incoming = local_config;
+                    incoming =
+                        get_last_config(&local_config.storage.data_dir).unwrap_or(local_config);
                 }
                 info!("register config success"; "version" => ?version);
                 Ok((version, incoming))
             }
-            _ => Err(format!("failed to register config, response: {:?}", resp).into()),
+            _ => Err(CfgError::Other(
+                format!("failed to register config, response: {:?}", resp).into(),
+            )),
         }
     }
 
@@ -2346,7 +2611,7 @@ impl ConfigHandler {
     }
 }
 
-use crate::raftstore::store::DynamicConfig;
+use raftstore::store::DynamicConfig;
 impl DynamicConfig for ConfigHandler {
     fn refresh(&mut self, cfg_client: &dyn ConfigClient) {
         debug!(
@@ -2448,7 +2713,7 @@ mod tests {
 
         let mut tikv_cfg = TiKvConfig::default();
         tikv_cfg.storage.data_dir = path.as_path().to_str().unwrap().to_owned();
-        assert!(persist_critical_config(&tikv_cfg).is_ok());
+        assert!(persist_config(&tikv_cfg).is_ok());
     }
 
     #[test]
@@ -2583,7 +2848,7 @@ mod tests {
             .unwrap(),
         );
 
-        let mut cfg_controller = ConfigController::new(cfg, Default::default());
+        let mut cfg_controller = ConfigController::new(cfg, Default::default(), false);
         cfg_controller.register(
             Module::Rocksdb,
             Box::new(DBConfigManger::new(engine.clone(), DBType::Kv)),
@@ -2651,5 +2916,68 @@ mod tests {
         assert_eq!(diff.len(), 1);
         assert_eq!(diff[0].0.as_str(), "blob_run_mode");
         assert_eq!(diff[0].1.as_str(), "kFallback");
+    }
+
+    #[test]
+    fn test_compatible_adjust_validate_equal() {
+        // After calling many time of `compatible_adjust` and `validate` should has
+        // the same effect as calling `compatible_adjust` and `validate` one time
+        let mut c = TiKvConfig::default();
+        let mut cfg = c.clone();
+        c.compatible_adjust();
+        c.validate().unwrap();
+
+        for _ in 0..10 {
+            cfg.compatible_adjust();
+            cfg.validate().unwrap();
+            assert_eq!(c, cfg);
+        }
+    }
+
+    #[test]
+    fn test_invalid_config_rollback() {
+        let mut valid_cfg = TiKvConfig::default();
+        assert!(valid_cfg.validate().is_ok());
+        // Valid config do not have rollback
+        assert!(valid_cfg
+            .validate_with_rollback(&TiKvConfig::default())
+            .is_empty());
+
+        // Call validate_with_rollback with an invalid config will
+        // return a rollback of the cause of invalid
+        let mut c = valid_cfg.clone();
+        // invalid config
+        c.gc.batch_keys = 0;
+        // valid config
+        c.raft_store.raft_log_gc_threshold = 200;
+        assert!(c.validate().is_err());
+        let rollback = to_config_entry(c.validate_with_rollback(&valid_cfg)).unwrap();
+        assert_eq!(rollback.len(), 1);
+        assert_eq!(rollback[0].name, "gc.batch-keys");
+        assert_eq!(
+            rollback[0].value,
+            toml::to_string(&valid_cfg.gc.batch_keys).unwrap()
+        );
+
+        // Some check in `validate` may relative to many configs and if
+        // the config can not pass the check, a rollback of all config
+        // relative to the check will return
+        let mut c = valid_cfg.clone();
+        // config check: region_max_keys >= region_split_keys
+        c.coprocessor.region_max_keys = 0;
+        assert!(c.validate().is_err());
+        let mut rollback = to_config_entry(c.validate_with_rollback(&valid_cfg)).unwrap();
+        rollback.sort_unstable_by(|a, b| a.name.partial_cmp(&b.name).unwrap());
+        assert_eq!(rollback.len(), 2);
+        assert_eq!(rollback[0].name, "coprocessor.region-max-keys");
+        assert_eq!(
+            rollback[0].value,
+            toml::to_string(&valid_cfg.coprocessor.region_max_keys).unwrap()
+        );
+        assert_eq!(rollback[1].name, "coprocessor.region-split-keys");
+        assert_eq!(
+            rollback[1].value,
+            toml::to_string(&valid_cfg.coprocessor.region_split_keys).unwrap()
+        );
     }
 }

@@ -3,23 +3,24 @@
 use std::f64::INFINITY;
 use std::sync::{Arc, Mutex};
 
-use engine::rocks::util::{compact_files_in_range, ingest_maybe_slowdown_writes};
 use engine::rocks::DB;
-use engine::{name_to_cf, CF_DEFAULT};
+use engine_traits::{name_to_cf, CompactExt, MiscExt, CF_DEFAULT};
 use futures::sync::mpsc;
 use futures::{future, Future, Stream};
 use futures_cpupool::{Builder, CpuPool};
 use grpcio::{ClientStreamingSink, RequestStream, RpcContext, UnarySink};
+use kvproto::errorpb;
 use kvproto::import_sstpb::*;
 use kvproto::raft_cmdpb::*;
 
-use crate::raftstore::router::RaftStoreRouter;
-use crate::raftstore::store::Callback;
 use crate::server::CONFIG_ROCKSDB_GAUGE;
-use engine_rocks::RocksEngine;
+use engine_rocks::{Compat, RocksEngine};
 use engine_traits::{SstExt, SstWriterBuilder};
+use raftstore::router::RaftStoreRouter;
+use raftstore::store::Callback;
 use sst_importer::send_rpc_response;
 use tikv_util::future::paired_future_callback;
+use tikv_util::security::{check_common_name, SecurityManager};
 use tikv_util::time::{Instant, Limiter};
 
 use sst_importer::import_mode::*;
@@ -40,6 +41,7 @@ pub struct ImportSSTService<Router> {
     importer: Arc<SSTImporter>,
     switcher: Arc<Mutex<ImportModeSwitcher>>,
     limiter: Limiter,
+    security_mgr: Arc<SecurityManager>,
 }
 
 impl<Router: RaftStoreRouter> ImportSSTService<Router> {
@@ -48,6 +50,7 @@ impl<Router: RaftStoreRouter> ImportSSTService<Router> {
         router: Router,
         engine: Arc<DB>,
         importer: Arc<SSTImporter>,
+        security_mgr: Arc<SecurityManager>,
     ) -> ImportSSTService<Router> {
         let threads = Builder::new()
             .name_prefix("sst-importer")
@@ -61,6 +64,7 @@ impl<Router: RaftStoreRouter> ImportSSTService<Router> {
             importer,
             switcher: Arc::new(Mutex::new(ImportModeSwitcher::new())),
             limiter: Limiter::new(INFINITY),
+            security_mgr,
         }
     }
 }
@@ -72,6 +76,9 @@ impl<Router: RaftStoreRouter> ImportSst for ImportSSTService<Router> {
         req: SwitchModeRequest,
         sink: UnarySink<SwitchModeResponse>,
     ) {
+        if !check_common_name(self.security_mgr.cert_allowed_cn(), &ctx) {
+            return;
+        }
         let label = "switch_mode";
         let timer = Instant::now_coarse();
 
@@ -109,6 +116,9 @@ impl<Router: RaftStoreRouter> ImportSst for ImportSSTService<Router> {
         stream: RequestStream<UploadRequest>,
         sink: ClientStreamingSink<UploadResponse>,
     ) {
+        if !check_common_name(self.security_mgr.cert_allowed_cn(), &ctx) {
+            return;
+        }
         let label = "upload";
         let timer = Instant::now_coarse();
         let import = Arc::clone(&self.importer);
@@ -160,6 +170,9 @@ impl<Router: RaftStoreRouter> ImportSst for ImportSSTService<Router> {
         req: DownloadRequest,
         sink: UnarySink<DownloadResponse>,
     ) {
+        if !check_common_name(self.security_mgr.cert_allowed_cn(), &ctx) {
+            return;
+        }
         let label = "download";
         let timer = Instant::now_coarse();
         let importer = Arc::clone(&self.importer);
@@ -183,14 +196,19 @@ impl<Router: RaftStoreRouter> ImportSst for ImportSSTService<Router> {
 
             future::result(res)
                 .map_err(Error::from)
-                .map(|range| {
+                .then(|res| {
                     let mut resp = DownloadResponse::default();
-                    if let Some(r) = range {
-                        resp.set_range(r);
-                    } else {
-                        resp.set_is_empty(true);
+                    match res {
+                        Ok(range) => {
+                            if let Some(r) = range {
+                                resp.set_range(r);
+                            } else {
+                                resp.set_is_empty(true);
+                            }
+                        }
+                        Err(e) => resp.set_error(e.into()),
                     }
-                    resp
+                    Ok(resp)
                 })
                 .then(move |res| send_rpc_response!(res, sink, label, timer))
         }));
@@ -207,17 +225,31 @@ impl<Router: RaftStoreRouter> ImportSst for ImportSSTService<Router> {
         mut req: IngestRequest,
         sink: UnarySink<IngestResponse>,
     ) {
+        if !check_common_name(self.security_mgr.cert_allowed_cn(), &ctx) {
+            return;
+        }
         let label = "ingest";
         let timer = Instant::now_coarse();
 
         if self.switcher.lock().unwrap().get_mode() == SwitchMode::Normal
-            && ingest_maybe_slowdown_writes(&self.engine, CF_DEFAULT)
+            && self
+                .engine
+                .c()
+                .ingest_maybe_slowdown_writes(CF_DEFAULT)
+                .expect("cf")
         {
-            return send_rpc_error(
-                ctx,
-                sink,
-                Error::Engine(box_err!("too many sst files are ingesting.")),
-            );
+            let err = "too many sst files are ingesting";
+            let mut server_is_busy_err = errorpb::ServerIsBusy::default();
+            server_is_busy_err.set_reason(err.to_string());
+            let mut errorpb = errorpb::Error::default();
+            errorpb.set_message(err.to_string());
+            errorpb.set_server_is_busy(server_is_busy_err);
+            let mut resp = IngestResponse::default();
+            resp.set_error(errorpb);
+            ctx.spawn(sink.success(resp).map_err(|e| {
+                warn!("send rpc failed"; "err" => %e);
+            }));
+            return;
         }
         // Make ingest command.
         let mut ingest = Request::default();
@@ -234,7 +266,12 @@ impl<Router: RaftStoreRouter> ImportSst for ImportSSTService<Router> {
 
         let (cb, future) = paired_future_callback();
         if let Err(e) = self.router.send_command(cmd, Callback::Write(cb)) {
-            return send_rpc_error(ctx, sink, e);
+            let mut resp = IngestResponse::default();
+            resp.set_error(e.into());
+            ctx.spawn(sink.success(resp).map_err(|e| {
+                warn!("send rpc failed"; "err" => %e);
+            }));
+            return;
         }
 
         ctx.spawn(
@@ -261,6 +298,9 @@ impl<Router: RaftStoreRouter> ImportSst for ImportSSTService<Router> {
         req: CompactRequest,
         sink: UnarySink<CompactResponse>,
     ) {
+        if !check_common_name(self.security_mgr.cert_allowed_cn(), &ctx) {
+            return;
+        }
         let label = "compact";
         let timer = Instant::now_coarse();
         let engine = Arc::clone(&self.engine);
@@ -280,7 +320,7 @@ impl<Router: RaftStoreRouter> ImportSst for ImportSSTService<Router> {
                 Some(req.get_output_level())
             };
 
-            let res = compact_files_in_range(&engine, start, end, output_level);
+            let res = engine.c().compact_files_in_range(start, end, output_level);
             match res {
                 Ok(_) => info!(
                     "compact files in range";
@@ -309,6 +349,9 @@ impl<Router: RaftStoreRouter> ImportSst for ImportSSTService<Router> {
         req: SetDownloadSpeedLimitRequest,
         sink: UnarySink<SetDownloadSpeedLimitResponse>,
     ) {
+        if !check_common_name(self.security_mgr.cert_allowed_cn(), &ctx) {
+            return;
+        }
         let label = "set_download_speed_limit";
         let timer = Instant::now_coarse();
 

@@ -18,13 +18,13 @@ use std::thread::JoinHandle;
 
 use self::deadlock::{Detector, RoleChangeNotifier};
 use self::waiter_manager::WaiterManager;
-use crate::raftstore::coprocessor::CoprocessorHost;
 use crate::server::resolve::StoreAddrResolver;
 use crate::server::{Error, Result};
 use crate::storage::{
     lock_manager::{Lock, LockManager as LockManagerTrait, WaitTimeout},
     ProcessResult, StorageCallback,
 };
+use raftstore::coprocessor::CoprocessorHost;
 
 use parking_lot::Mutex;
 use pd_client::PdClient;
@@ -188,10 +188,11 @@ impl LockManager {
     }
 
     /// Creates a `DeadlockService` to handle deadlock detect requests from other nodes.
-    pub fn deadlock_service(&self) -> DeadlockService {
+    pub fn deadlock_service(&self, security_mgr: Arc<SecurityManager>) -> DeadlockService {
         DeadlockService::new(
             self.waiter_mgr_scheduler.clone(),
             self.detector_scheduler.clone(),
+            security_mgr,
         )
     }
 
@@ -277,7 +278,8 @@ mod tests {
     use self::metrics::*;
     use self::waiter_manager::tests::*;
     use super::*;
-    use crate::raftstore::coprocessor::RegionChangeEvent;
+    use raftstore::coprocessor::RegionChangeEvent;
+    use tikv_util::config::ReadableDuration;
     use tikv_util::security::SecurityConfig;
 
     use std::thread;
@@ -292,8 +294,8 @@ mod tests {
 
         let mut lock_mgr = LockManager::new();
         let mut cfg = Config::default();
-        cfg.wait_for_lock_timeout = 3000;
-        cfg.wake_up_delay_duration = 100;
+        cfg.wait_for_lock_timeout = ReadableDuration::millis(3000);
+        cfg.wake_up_delay_duration = ReadableDuration::millis(100);
         lock_mgr.register_detector_role_change_observer(&mut coprocessor_host);
         lock_mgr
             .start(
@@ -337,7 +339,7 @@ mod tests {
         );
         assert!(lock_mgr.has_waiter());
         assert_elapsed(
-            || expect_key_is_locked(f.wait().unwrap().unwrap().pop().unwrap(), lock_info),
+            || expect_key_is_locked(f.wait().unwrap().unwrap(), lock_info),
             2900,
             3200,
         );
@@ -456,7 +458,7 @@ mod tests {
             None,
         );
         assert_elapsed(
-            || expect_key_is_locked(f.wait().unwrap().unwrap().pop().unwrap(), lock_info),
+            || expect_key_is_locked(f.wait().unwrap().unwrap(), lock_info),
             0,
             200,
         );

@@ -4,9 +4,9 @@ mod chunk;
 
 use test::Bencher;
 
-use tidb_query::codec::chunk::{Chunk, ChunkEncoder};
-use tidb_query::codec::datum::Datum;
-use tidb_query::codec::mysql::*;
+use tidb_query_datatype::codec::chunk::{Chunk, ChunkEncoder};
+use tidb_query_datatype::codec::datum::Datum;
+use tidb_query_datatype::codec::mysql::*;
 use tidb_query_datatype::FieldTypeTp;
 use tipb::FieldType;
 
@@ -26,7 +26,7 @@ fn bench_encode_chunk(b: &mut Bencher) {
         let s = format!("{}.123435", row_id);
         let bs = Datum::Bytes(s.as_bytes().to_vec());
         let dec = Datum::Dec(s.parse().unwrap());
-        let json = Datum::Json(Json::String(s));
+        let json = Datum::Json(Json::from_string(s).unwrap());
         chunk.append_datum(0, &Datum::Null).unwrap();
         chunk.append_datum(1, &Datum::I64(row_id as i64)).unwrap();
         chunk.append_datum(2, &bs).unwrap();

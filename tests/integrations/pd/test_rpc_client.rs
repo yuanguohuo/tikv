@@ -12,8 +12,8 @@ use kvproto::metapb;
 use kvproto::pdpb;
 
 use pd_client::{validate_endpoints, Config, Error as PdError, PdClient, RegionStat, RpcClient};
+use raftstore::store;
 use test_util;
-use tikv::raftstore::store;
 use tikv_util::security::{SecurityConfig, SecurityManager};
 use txn_types::TimeStamp;
 
@@ -364,7 +364,7 @@ fn test_restart_leader_insecure() {
 
 #[test]
 fn test_restart_leader_secure() {
-    let security_cfg = test_util::new_security_cfg();
+    let security_cfg = test_util::new_security_cfg(None);
     let mgr = SecurityManager::new(&security_cfg).unwrap();
     restart_leader(mgr)
 }

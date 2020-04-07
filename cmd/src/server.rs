@@ -9,17 +9,27 @@
 //! We keep these components in the `TiKVServer` struct.
 
 use crate::{setup::*, signal_handler};
-use engine::{
-    rocks::util::{metrics_flusher::MetricsFlusher, security::encrypted_env_from_cipher_file},
-    rocks::{self, util::metrics_flusher::DEFAULT_FLUSHER_INTERVAL},
-};
+use encryption::DataKeyManager;
+use engine::rocks;
+use engine_rocks::{encryption::get_env, Compat, RocksEngine};
+use engine_traits::{KvEngines, MetricsFlusher};
 use fs2::FileExt;
 use futures_cpupool::Builder;
 use kvproto::{
-    backup::create_backup, deadlock::create_deadlock, debugpb::create_debug,
-    diagnosticspb::create_diagnostics, import_sstpb::create_import_sst,
+    backup::create_backup, cdcpb::create_change_data, configpb, deadlock::create_deadlock,
+    debugpb::create_debug, diagnosticspb::create_diagnostics, import_sstpb::create_import_sst,
 };
-use pd_client::{PdClient, RpcClient};
+use pd_client::{Error as PdError, PdClient, RpcClient};
+use raftstore::{
+    coprocessor::{config::SplitCheckConfigManager, CoprocessorHost, RegionInfoAccessor},
+    router::ServerRaftStoreRouter,
+    store::{
+        config::RaftstoreConfigManager,
+        fsm,
+        fsm::store::{RaftBatchSystem, RaftRouter, StoreMeta, PENDING_VOTES_CAP},
+        new_compaction_listener, LocalReader, PdTask, SnapManagerBuilder, SplitCheckRunner,
+    },
+};
 use std::{
     convert::TryFrom,
     fmt,
@@ -27,25 +37,12 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread::JoinHandle,
-    time::Duration,
 };
-use tikv::config::ConfigHandler;
-use tikv::raftstore::coprocessor::config::SplitCheckConfigManager;
-use tikv::raftstore::router::ServerRaftStoreRouter;
-use tikv::raftstore::store::config::RaftstoreConfigManager;
 use tikv::{
-    config::{ConfigController, DBConfigManger, DBType, TiKvConfig},
+    config::{CfgError, ConfigController, ConfigHandler, DBConfigManger, DBType, TiKvConfig},
     coprocessor,
     import::{ImportSSTService, SSTImporter},
-    raftstore::{
-        coprocessor::{CoprocessorHost, RegionInfoAccessor},
-        store::{
-            fsm,
-            fsm::store::{RaftBatchSystem, RaftRouter, StoreMeta, PENDING_VOTES_CAP},
-            new_compaction_listener, LocalReader, PdTask, SnapManagerBuilder, SplitCheckRunner,
-        },
-    },
-    read_pool::{ReadPool, ReadPoolRunner},
+    read_pool::{build_yatp_read_pool, ReadPool},
     server::{
         config::Config as ServerConfig,
         create_raft_storage,
@@ -59,33 +56,50 @@ use tikv::{
     storage,
 };
 use tikv_util::config::VersionTrack;
+use tikv_util::metrics::ensure_updater;
 use tikv_util::{
     check_environment_variables,
+    config::ensure_dir_exist,
     security::SecurityManager,
+    sys::sys_quota::SysQuota,
     time::Monitor,
     worker::{FutureScheduler, FutureWorker, Worker},
-};
-use yatp::{
-    pool::CloneRunnerBuilder,
-    queue::{multilevel, QueueType},
 };
 
 /// Run a TiKV server. Returns when the server is shutdown by the user, in which
 /// case the server will be properly stopped.
 pub fn run_tikv(config: TiKvConfig) {
+    // Sets the global logger ASAP.
+    // It is okay to use the config w/o `validate()`,
+    // because `initial_logger()` handles various conditions.
+    // TODO: currently the logger config can not be managed
+    // by PD and has to be provided when starting (or default
+    // config will be use). Consider remove this constraint.
+    initial_logger(&config);
+
+    // Print version information.
+    tikv::log_tikv_info();
+
+    // Print resource quota.
+    SysQuota::new().log_quota();
+
     // Do some prepare works before start.
-    pre_start(&config);
+    pre_start();
 
     let mut tikv = TiKVServer::init(config);
 
     let _m = Monitor::default();
 
     tikv.init_fs();
+    tikv.init_yatp();
+    tikv.init_encryption();
     tikv.init_engines();
     let gc_worker = tikv.init_gc_worker();
     let server_config = tikv.init_servers(&gc_worker);
     tikv.register_services(gc_worker);
     tikv.init_metrics_flusher();
+
+    ensure_updater();
 
     tikv.run_server(server_config);
 
@@ -102,10 +116,11 @@ struct TiKVServer {
     cfg_controller: Option<ConfigController>,
     security_mgr: Arc<SecurityManager>,
     pd_client: Arc<RpcClient>,
-    router: RaftRouter,
+    router: RaftRouter<RocksEngine>,
     system: Option<RaftBatchSystem>,
     resolver: resolve::PdStoreAddrResolver,
     store_path: PathBuf,
+    encryption_key_manager: Option<Arc<DataKeyManager>>,
     engines: Option<Engines>,
     servers: Option<Servers>,
     region_info_accessor: RegionInfoAccessor,
@@ -126,6 +141,7 @@ struct Servers {
     server: Server<ServerRaftStoreRouter, resolve::PdStoreAddrResolver>,
     node: Node<RpcClient>,
     importer: Arc<SSTImporter>,
+    cdc_scheduler: tikv_util::worker::Scheduler<cdc::Task>,
 }
 
 impl TiKVServer {
@@ -163,6 +179,7 @@ impl TiKVServer {
             system: Some(system),
             resolver,
             store_path,
+            encryption_key_manager: None,
             engines: None,
             servers: None,
             region_info_accessor,
@@ -182,39 +199,21 @@ impl TiKVServer {
     /// - If the config can't pass `validate()`
     /// - If the max open file descriptor limit is not high enough to support
     ///   the main database and the raft database.
-    fn init_config(mut config: TiKvConfig, pd_client: Arc<RpcClient>) -> ConfigController {
-        let version = if config.dynamic_config {
-            // Advertise address and cluster id can not be changed
-            if config.server.advertise_addr.is_empty() {
-                config.server.advertise_addr = config.server.addr.clone();
-            }
-            let advertise_addr = config.server.advertise_addr.clone();
-            let cluster_id = config.server.cluster_id;
-            // Using the same file for initialize global logger
-            // and diagnostics service
-            let log_file = config.log_file.clone();
-
-            let (v, mut cfg) =
-                ConfigHandler::create(advertise_addr.clone(), Arc::clone(&pd_client), config)
-                    .unwrap_or_else(|e| fatal!("failed to register config from pd: {}", e));
-
-            cfg.server.advertise_addr = advertise_addr;
-            cfg.server.cluster_id = cluster_id;
-            cfg.log_file = log_file;
-            cfg.dynamic_config = true;
-            config = cfg;
-            v
+    fn init_config(config: TiKvConfig, pd_client: Arc<RpcClient>) -> ConfigController {
+        let (mut config, version) = if config.enable_dynamic_config {
+            TiKVServer::register_config(config, pd_client)
         } else {
-            Default::default()
+            (config, configpb::Version::default())
         };
+
+        ensure_dir_exist(&config.storage.data_dir).unwrap();
+        ensure_dir_exist(&config.raft_store.raftdb_path).unwrap();
 
         validate_and_persist_config(&mut config, true);
         check_system_config(&config);
 
         tikv_util::set_panic_hook(false, &config.storage.data_dir);
 
-        // Print version information.
-        tikv::log_tikv_info();
         info!(
             "using config";
             "version" => ?version,
@@ -227,7 +226,46 @@ impl TiKVServer {
 
         config.write_into_metrics();
 
-        ConfigController::new(config, version)
+        ConfigController::new(config, version, true)
+    }
+
+    fn register_config(
+        mut config: TiKvConfig,
+        pd_client: Arc<RpcClient>,
+    ) -> (TiKvConfig, configpb::Version) {
+        if config.server.advertise_addr.is_empty() {
+            info!(
+                "no advertise-addr is specified, falling back to default addr";
+                "addr" => %config.server.addr
+            );
+            config.server.advertise_addr = config.server.addr.clone();
+        }
+        // Advertise address and cluster id can not be changed
+        let advertise_addr = config.server.advertise_addr.clone();
+        let cluster_id = config.server.cluster_id;
+        // Using the same file for initialize global logger
+        // and diagnostics service
+        let log_file = config.log_file.clone();
+
+        match ConfigHandler::create(advertise_addr.clone(), pd_client, config.clone()) {
+            Ok((v, mut cfg)) => {
+                cfg.server.advertise_addr = advertise_addr;
+                cfg.server.cluster_id = cluster_id;
+                cfg.log_file = log_file;
+                cfg.enable_dynamic_config = true;
+                (cfg, v)
+            }
+            Err(err) => {
+                if let CfgError::Pd(PdError::Grpc(grpcio::Error::RpcFailure(status))) = &err {
+                    if status.status == grpcio::RpcStatusCode::UNIMPLEMENTED {
+                        config.enable_dynamic_config = false;
+                        warn!("can not use dynamic config because pd did not implement service configpb.Config");
+                        return (config, configpb::Version::default());
+                    }
+                }
+                fatal!("failed to register config to pd: {:?}", err);
+            }
+        }
     }
 
     fn connect_to_pd_cluster(
@@ -281,26 +319,26 @@ impl TiKVServer {
         .unwrap();
     }
 
+    fn init_yatp(&self) {
+        yatp::metrics::set_namespace(Some("tikv"));
+        prometheus::register(Box::new(yatp::metrics::MULTILEVEL_LEVEL0_CHANCE.clone())).unwrap();
+        prometheus::register(Box::new(yatp::metrics::MULTILEVEL_LEVEL_ELAPSED.clone())).unwrap();
+    }
+
+    fn init_encryption(&mut self) {
+        self.encryption_key_manager =
+            DataKeyManager::from_config(&self.config.encryption, &self.config.storage.data_dir)
+                .unwrap()
+                .map(|key_manager| Arc::new(key_manager));
+    }
+
     fn init_engines(&mut self) {
+        let env = get_env(self.encryption_key_manager.clone(), None).unwrap();
         let block_cache = self.config.storage.block_cache.build_shared_cache();
 
         let raft_db_path = Path::new(&self.config.raft_store.raftdb_path);
         let mut raft_db_opts = self.config.raftdb.build_opt();
-        // Create encrypted env from cipher file
-        let encrypted_env = if !self.security_mgr.cipher_file().is_empty() {
-            match encrypted_env_from_cipher_file(&self.security_mgr.cipher_file(), None) {
-                Err(e) => fatal!(
-                    "failed to create encrypted env from cipher file, err {:?}",
-                    e
-                ),
-                Ok(env) => Some(env),
-            }
-        } else {
-            None
-        };
-        if let Some(ref encrypted_env) = encrypted_env {
-            raft_db_opts.set_env(encrypted_env.clone());
-        }
+        raft_db_opts.set_env(env.clone());
         let raft_db_cf_opts = self.config.raftdb.build_cf_opts(&block_cache);
         let raft_engine = rocks::util::new_engine_opt(
             raft_db_path.to_str().unwrap(),
@@ -311,10 +349,8 @@ impl TiKVServer {
 
         // Create kv engine.
         let mut kv_db_opts = self.config.rocksdb.build_opt();
+        kv_db_opts.set_env(env);
         kv_db_opts.add_event_listener(new_compaction_listener(self.router.clone()));
-        if let Some(encrypted_env) = encrypted_env {
-            kv_db_opts.set_env(encrypted_env);
-        }
         let kv_cfs_opts = self.config.rocksdb.build_cf_opts(&block_cache);
         let db_path = self
             .store_path
@@ -329,8 +365,11 @@ impl TiKVServer {
             block_cache.is_some(),
         );
         let store_meta = Arc::new(Mutex::new(StoreMeta::new(PENDING_VOTES_CAP)));
-        let local_reader =
-            LocalReader::new(engines.kv.clone(), store_meta.clone(), self.router.clone());
+        let local_reader = LocalReader::new(
+            engines.kv.c().clone(),
+            store_meta.clone(),
+            self.router.clone(),
+        );
         let raft_router = ServerRaftStoreRouter::new(self.router.clone(), local_reader);
 
         let cfg_controller = self.cfg_controller.as_mut().unwrap();
@@ -402,40 +441,33 @@ impl TiKVServer {
         let pd_worker = FutureWorker::new("pd-worker");
         let pd_sender = pd_worker.scheduler();
 
-        let unified_read_pool = if self.config.readpool.unify_read_pool {
-            let unified_read_pool_cfg = &self.config.readpool.unified;
-            let mut builder = yatp::Builder::new("unified-read-pool");
-            builder
-                .min_thread_count(unified_read_pool_cfg.min_thread_count)
-                .max_thread_count(unified_read_pool_cfg.max_thread_count);
-            let multilevel_builder = multilevel::Builder::new(Default::default());
-            let read_pool_runner = ReadPoolRunner::new(engines.engine.clone(), Default::default());
-            let runner_builder =
-                multilevel_builder.runner_builder(CloneRunnerBuilder(read_pool_runner));
-            Some(builder.build_with_queue_and_runner(
-                QueueType::Multilevel(multilevel_builder),
-                runner_builder,
+        let unified_read_pool = if self.config.readpool.is_unified_pool_enabled() {
+            Some(build_yatp_read_pool(
+                &self.config.readpool.unified,
+                pd_sender.clone(),
+                engines.engine.clone(),
             ))
         } else {
             None
         };
 
-        let storage_read_pool = if self.config.readpool.unify_read_pool {
-            ReadPool::from(unified_read_pool.as_ref().unwrap().remote().clone())
+        let storage_read_pool_handle = if self.config.readpool.storage.use_unified_pool() {
+            unified_read_pool.as_ref().unwrap().handle()
         } else {
-            let cop_read_pools = storage::build_read_pool(
+            let storage_read_pools = ReadPool::from(storage::build_read_pool(
                 &self.config.readpool.storage,
                 pd_sender.clone(),
                 engines.engine.clone(),
-            );
-            ReadPool::from(cop_read_pools)
+            ));
+            storage_read_pools.handle()
         };
 
         let storage = create_raft_storage(
             engines.engine.clone(),
             &self.config.storage,
-            storage_read_pool,
+            storage_read_pool_handle,
             lock_mgr.clone(),
+            self.config.pessimistic_txn.pipelined,
         )
         .unwrap_or_else(|e| fatal!("failed to create raft storage: {}", e));
 
@@ -456,16 +488,22 @@ impl TiKVServer {
             .build(snap_path, Some(self.router.clone()));
 
         // Create coprocessor endpoint.
-        let cop_read_pool = if self.config.readpool.unify_read_pool {
-            ReadPool::from(unified_read_pool.as_ref().unwrap().remote().clone())
+        let cop_read_pool_handle = if self.config.readpool.coprocessor.use_unified_pool() {
+            unified_read_pool.as_ref().unwrap().handle()
         } else {
-            let cop_read_pools = coprocessor::readpool_impl::build_read_pool(
+            let cop_read_pools = ReadPool::from(coprocessor::readpool_impl::build_read_pool(
                 &self.config.readpool.coprocessor,
                 pd_sender.clone(),
                 engines.engine.clone(),
-            );
-            ReadPool::from(cop_read_pools)
+            ));
+            cop_read_pools.handle()
         };
+
+        // Create and register cdc.
+        let mut cdc_worker = Box::new(tikv_util::worker::Worker::new("cdc"));
+        let cdc_scheduler = cdc_worker.scheduler();
+        let cdc_ob = cdc::CdcObserver::new(cdc_scheduler.clone());
+        cdc_ob.register_to(&mut coprocessor_host);
 
         let server_config = Arc::new(self.config.server.clone());
 
@@ -474,7 +512,7 @@ impl TiKVServer {
             &server_config,
             &self.security_mgr,
             storage,
-            coprocessor::Endpoint::new(&server_config, cop_read_pool),
+            coprocessor::Endpoint::new(&server_config, cop_read_pool_handle),
             engines.raft_router.clone(),
             self.resolver.clone(),
             snap_mgr.clone(),
@@ -488,7 +526,7 @@ impl TiKVServer {
 
         let mut split_check_worker = Worker::new("split-check");
         let split_check_runner = SplitCheckRunner::new(
-            engines.engines.kv.clone(),
+            engines.engines.kv.c().clone(),
             self.router.clone(),
             coprocessor_host.clone(),
             self.config.coprocessor.clone(),
@@ -521,6 +559,9 @@ impl TiKVServer {
             raft_store,
             self.pd_client.clone(),
         );
+
+        let raft_router = node.get_router();
+
         node.start(
             engines.engines.clone(),
             server.transport(),
@@ -546,12 +587,25 @@ impl TiKVServer {
             fatal!("failed to start auto_gc on storage, error: {}", e);
         }
 
+        // Start CDC.
+        let cdc_endpoint = cdc::Endpoint::new(
+            self.pd_client.clone(),
+            cdc_worker.scheduler(),
+            raft_router,
+            cdc_ob,
+        );
+        cdc_worker
+            .start(cdc_endpoint)
+            .unwrap_or_else(|e| fatal!("failed to start cdc: {}", e));
+        self.to_stop.push(cdc_worker);
+
         self.servers = Some(Servers {
             pd_sender,
             lock_mgr,
             server,
             node,
             importer,
+            cdc_scheduler,
         });
 
         server_config
@@ -567,6 +621,7 @@ impl TiKVServer {
             engines.raft_router.clone(),
             engines.engines.kv.clone(),
             servers.importer.clone(),
+            self.security_mgr.clone(),
         );
         if servers
             .server
@@ -588,7 +643,8 @@ impl TiKVServer {
             pool.clone(),
             engines.raft_router.clone(),
             gc_worker.get_config_manager(),
-            self.config.dynamic_config,
+            self.config.enable_dynamic_config,
+            self.security_mgr.clone(),
         );
         if servers
             .server
@@ -599,7 +655,12 @@ impl TiKVServer {
         }
 
         // Create Diagnostics service
-        let diag_service = DiagnosticsService::new(pool, self.config.log_file.clone());
+        let diag_service = DiagnosticsService::new(
+            pool,
+            self.config.log_file.clone(),
+            self.config.slow_log_file.clone(),
+            self.security_mgr.clone(),
+        );
         if servers
             .server
             .register_service(create_diagnostics(diag_service))
@@ -612,7 +673,9 @@ impl TiKVServer {
         if let Some(lock_mgr) = servers.lock_mgr.as_mut() {
             if servers
                 .server
-                .register_service(create_deadlock(lock_mgr.deadlock_service()))
+                .register_service(create_deadlock(
+                    lock_mgr.deadlock_service(self.security_mgr.clone()),
+                ))
                 .is_some()
             {
                 fatal!("failed to register deadlock service");
@@ -632,7 +695,7 @@ impl TiKVServer {
         // Backup service.
         let mut backup_worker = Box::new(tikv_util::worker::Worker::new("backup-endpoint"));
         let backup_scheduler = backup_worker.scheduler();
-        let backup_service = backup::Service::new(backup_scheduler);
+        let backup_service = backup::Service::new(backup_scheduler, self.security_mgr.clone());
         if servers
             .server
             .register_service(create_backup(backup_service))
@@ -652,14 +715,25 @@ impl TiKVServer {
             .start_with_timer(backup_endpoint, backup_timer)
             .unwrap_or_else(|e| fatal!("failed to start backup endpoint: {}", e));
 
+        let cdc_service =
+            cdc::Service::new(servers.cdc_scheduler.clone(), self.security_mgr.clone());
+        if servers
+            .server
+            .register_service(create_change_data(cdc_service))
+            .is_some()
+        {
+            fatal!("failed to register cdc service");
+        }
+
         self.to_stop.push(backup_worker);
     }
 
     fn init_metrics_flusher(&mut self) {
-        let mut metrics_flusher = Box::new(MetricsFlusher::new(
-            self.engines.as_ref().unwrap().engines.clone(),
-            Duration::from_millis(DEFAULT_FLUSHER_INTERVAL),
-        ));
+        let mut metrics_flusher = Box::new(MetricsFlusher::new(KvEngines::new(
+            RocksEngine::from_db(self.engines.as_ref().unwrap().engines.kv.clone()),
+            RocksEngine::from_db(self.engines.as_ref().unwrap().engines.raft.clone()),
+            self.engines.as_ref().unwrap().engines.shared_block_cache,
+        )));
 
         // Start metrics flusher
         if let Err(e) = metrics_flusher.start() {
@@ -692,7 +766,10 @@ impl TiKVServer {
                 server.pd_sender.clone(),
             ));
             // Start the status server.
-            if let Err(e) = status_server.start(self.config.server.status_addr.clone()) {
+            if let Err(e) = status_server.start(
+                self.config.server.status_addr.clone(),
+                &self.config.security,
+            ) {
                 error!(
                     "failed to bind addr for status service";
                     "err" => %e
@@ -739,16 +816,8 @@ impl TiKVServer {
 /// - if `vm.swappiness` is not 0
 /// - if data directories are not on SSDs
 /// - if the "TZ" environment variable is not set on unix
-fn pre_start(config: &TiKvConfig) {
-    // Sets the global logger ASAP.
-    // It is okay to use the config w/o `validate()`,
-    // because `initial_logger()` handles various conditions.
-    // TODO: currently the logger config has to be provided
-    // through command line. Consider remove this constraint.
-    initial_logger(&config);
-
+fn pre_start() {
     check_environment_variables();
-
     for e in tikv_util::config::check_kernel() {
         warn!(
             "check: kernel";
@@ -802,7 +871,7 @@ impl Stop for StatusServer {
     }
 }
 
-impl Stop for MetricsFlusher {
+impl Stop for MetricsFlusher<RocksEngine, RocksEngine> {
     fn stop(mut self: Box<Self>) {
         (*self).stop()
     }

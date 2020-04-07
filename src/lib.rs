@@ -26,15 +26,12 @@
 #![feature(box_patterns)]
 #![feature(shrink_to)]
 #![feature(drain_filter)]
+#![feature(str_strip)]
 
-#[macro_use]
-extern crate bitflags;
 #[macro_use(fail_point)]
 extern crate fail;
 #[macro_use]
 extern crate lazy_static;
-#[macro_use]
-extern crate prometheus;
 #[macro_use]
 extern crate quick_error;
 #[macro_use]
@@ -57,11 +54,11 @@ extern crate failure;
 #[cfg(test)]
 extern crate test;
 
+extern crate encryption;
+
 pub mod config;
 pub mod coprocessor;
 pub mod import;
-pub mod into_other;
-pub mod raftstore;
 pub mod read_pool;
 pub mod server;
 pub mod storage;

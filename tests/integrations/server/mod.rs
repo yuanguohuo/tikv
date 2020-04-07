@@ -3,6 +3,7 @@
 mod kv_service;
 mod lock_manager;
 mod raft_client;
+mod security;
 
 use std::sync::Arc;
 
@@ -158,7 +159,7 @@ trait MockKvService {
         RemoveLockObserverRequest,
         RemoveLockObserverResponse
     );
-    sstream_call!(
+    unary_call!(
         physical_scan_lock,
         PhysicalScanLockRequest,
         PhysicalScanLockResponse
@@ -249,7 +250,7 @@ impl<T: MockKvService + Clone + Send + 'static> Tikv for MockKv<T> {
         RemoveLockObserverRequest,
         RemoveLockObserverResponse
     );
-    sstream_call_dispatch!(
+    unary_call_dispatch!(
         physical_scan_lock,
         PhysicalScanLockRequest,
         PhysicalScanLockResponse

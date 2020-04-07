@@ -15,8 +15,8 @@ use kvproto::raft_serverpb::RaftMessage;
 use kvproto::raft_serverpb::{Done, SnapshotChunk};
 use kvproto::tikvpb::TikvClient;
 
-use crate::raftstore::router::RaftStoreRouter;
-use crate::raftstore::store::{GenericSnapshot, SnapEntry, SnapKey, SnapManager};
+use raftstore::router::RaftStoreRouter;
+use raftstore::store::{GenericSnapshot, SnapEntry, SnapKey, SnapManager};
 use tikv_util::security::SecurityManager;
 use tikv_util::worker::Runnable;
 use tikv_util::DeferContext;
@@ -342,7 +342,7 @@ impl<R: RaftStoreRouter + 'static> Runnable<Task> for Runner<R> {
                     self.pool.spawn(sink.fail(status)).forget();
                     return;
                 }
-                SNAP_TASK_COUNTER.with_label_values(&["recv"]).inc();
+                SNAP_TASK_COUNTER_STATIC.recv.inc();
 
                 let snap_mgr = self.snap_mgr.clone();
                 let raft_router = self.raft_router.clone();
@@ -368,7 +368,7 @@ impl<R: RaftStoreRouter + 'static> Runnable<Task> for Runner<R> {
                     cb(Err(Error::Other("Too many sending snapshot tasks".into())));
                     return;
                 }
-                SNAP_TASK_COUNTER.with_label_values(&["send"]).inc();
+                SNAP_TASK_COUNTER_STATIC.send.inc();
 
                 let env = Arc::clone(&self.env);
                 let mgr = self.snap_mgr.clone();

@@ -9,13 +9,15 @@ use kvproto::metapb;
 use kvproto::raft_serverpb::RegionLocalState;
 
 use engine::*;
+use engine_rocks::{CloneCompat, Compat};
+use engine_traits::{Peekable, ALL_CFS, CF_RAFT};
+use raftstore::coprocessor::CoprocessorHost;
+use raftstore::store::fsm::store::StoreMeta;
+use raftstore::store::{bootstrap_store, fsm, SnapManager};
 use test_raftstore::*;
 use tikv::config::ConfigController;
 use tikv::config::ConfigHandler;
 use tikv::import::SSTImporter;
-use tikv::raftstore::coprocessor::CoprocessorHost;
-use tikv::raftstore::store::fsm::store::StoreMeta;
-use tikv::raftstore::store::{bootstrap_store, fsm, SnapManager};
 use tikv::server::Node;
 use tikv_util::config::VersionTrack;
 use tikv_util::worker::{FutureWorker, Worker};
@@ -72,14 +74,16 @@ fn test_node_bootstrap_with_prepared_data() {
 
     // now another node at same time begin bootstrap node, but panic after prepared bootstrap
     // now rocksDB must have some prepare data
-    bootstrap_store(&engines, 0, 1).unwrap();
+    bootstrap_store(&engines.c(), 0, 1).unwrap();
     let region = node.prepare_bootstrap_cluster(&engines, 1).unwrap();
     assert!(engine
+        .c()
         .get_msg::<metapb::Region>(keys::PREPARE_BOOTSTRAP_KEY)
         .unwrap()
         .is_some());
     let region_state_key = keys::region_state_key(region.get_id());
     assert!(engine
+        .c()
         .get_msg_cf::<RegionLocalState>(CF_RAFT, &region_state_key)
         .unwrap()
         .is_some());
@@ -92,7 +96,7 @@ fn test_node_bootstrap_with_prepared_data() {
         Arc::new(SSTImporter::new(dir).unwrap())
     };
 
-    let cfg_controller = ConfigController::new(cfg.clone(), Default::default());
+    let cfg_controller = ConfigController::new(cfg.clone(), Default::default(), false);
     let config_client = ConfigHandler::start(
         cfg.server.advertise_addr,
         cfg_controller,
@@ -113,10 +117,12 @@ fn test_node_bootstrap_with_prepared_data() {
     )
     .unwrap();
     assert!(Arc::clone(&engine)
+        .c()
         .get_msg::<metapb::Region>(keys::PREPARE_BOOTSTRAP_KEY)
         .unwrap()
         .is_none());
     assert!(engine
+        .c()
         .get_msg_cf::<RegionLocalState>(CF_RAFT, &region_state_key)
         .unwrap()
         .is_none());

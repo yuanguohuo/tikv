@@ -139,7 +139,7 @@ impl TxnEntry {
                     let v = WriteRef::parse(&write.1)
                         .map_err(MvccError::from)?
                         .to_owned();
-                    let v = v.short_value.unwrap();
+                    let v = v.short_value.unwrap_or_else(Vec::default);
                     Ok((k, v))
                 }
             }
@@ -530,7 +530,8 @@ mod tests {
         TestEngineBuilder,
     };
     use crate::storage::mvcc::{Mutation, MvccTxn};
-    use engine::{CfName, IterOption};
+    use engine_traits::CfName;
+    use engine_traits::IterOptions;
     use kvproto::kvrpcpb::Context;
 
     const KEY_PREFIX: &str = "key_prefix";
@@ -671,7 +672,7 @@ mod tests {
         fn get_cf(&self, _: CfName, _: &Key) -> EngineResult<Option<Value>> {
             Ok(None)
         }
-        fn iter(&self, _: IterOption, _: ScanMode) -> EngineResult<Cursor<Self::Iter>> {
+        fn iter(&self, _: IterOptions, _: ScanMode) -> EngineResult<Cursor<Self::Iter>> {
             Ok(Cursor::new(
                 MockRangeSnapshotIter::default(),
                 ScanMode::Forward,
@@ -680,7 +681,7 @@ mod tests {
         fn iter_cf(
             &self,
             _: CfName,
-            _: IterOption,
+            _: IterOptions,
             _: ScanMode,
         ) -> EngineResult<Cursor<Self::Iter>> {
             Ok(Cursor::new(

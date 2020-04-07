@@ -4,15 +4,15 @@ use kvproto::raft_serverpb::RaftMessage;
 use raft::eraftpb::MessageType;
 use std::sync::{Arc, RwLock};
 
-use crate::raftstore::router::RaftStoreRouter;
-use crate::raftstore::store::Transport;
-use crate::raftstore::Result as RaftStoreResult;
 use crate::server::metrics::*;
 use crate::server::raft_client::RaftClient;
 use crate::server::resolve::StoreAddrResolver;
 use crate::server::snap::Task as SnapTask;
 use crate::server::Result;
 use raft::SnapshotStatus;
+use raftstore::router::RaftStoreRouter;
+use raftstore::store::Transport;
+use raftstore::Result as RaftStoreResult;
 use tikv_util::collections::HashSet;
 use tikv_util::worker::Scheduler;
 use tikv_util::HandyRwLock;
@@ -83,9 +83,7 @@ impl<T: RaftStoreRouter + 'static, S: StoreAddrResolver + 'static> ServerTranspo
 
         // No connection, try to resolve it.
         if self.resolving.rl().contains(&store_id) {
-            RESOLVE_STORE_COUNTER
-                .with_label_values(&["resolving"])
-                .inc();
+            RESOLVE_STORE_COUNTER_STATIC.resolving.inc();
             // If we are resolving the address, drop the message here.
             debug!(
                 "store address is being resolved, msg dropped";
@@ -97,8 +95,7 @@ impl<T: RaftStoreRouter + 'static, S: StoreAddrResolver + 'static> ServerTranspo
         }
 
         debug!("begin to resolve store address"; "store_id" => store_id);
-        RESOLVE_STORE_COUNTER.with_label_values(&["resolve"]).inc();
-
+        RESOLVE_STORE_COUNTER_STATIC.resolve.inc();
         self.resolving.wl().insert(store_id);
         self.resolve(store_id, msg);
     }
@@ -133,13 +130,14 @@ impl<T: RaftStoreRouter + 'static, S: StoreAddrResolver + 'static> ServerTranspo
             // clear resolving.
             trans.resolving.wl().remove(&store_id);
             if let Err(e) = addr {
-                RESOLVE_STORE_COUNTER.with_label_values(&["failed"]).inc();
+                RESOLVE_STORE_COUNTER_STATIC.failed.inc();
                 error!("resolve store address failed"; "store_id" => store_id, "err" => ?e);
                 trans.report_unreachable(msg);
                 return;
             }
 
-            RESOLVE_STORE_COUNTER.with_label_values(&["success"]).inc();
+            RESOLVE_STORE_COUNTER_STATIC.success.inc();
+
             let addr = addr.unwrap();
             info!("resolve store address ok"; "store_id" => store_id, "addr" => %addr);
             trans.raft_client.wl().addrs.insert(store_id, addr.clone());
@@ -150,7 +148,7 @@ impl<T: RaftStoreRouter + 'static, S: StoreAddrResolver + 'static> ServerTranspo
         if let Err(e) = self.resolver.resolve(store_id, cb) {
             error!("resolve store address failed"; "store_id" => store_id, "err" => ?e);
             self.resolving.wl().remove(&store_id);
-            RESOLVE_STORE_COUNTER.with_label_values(&["failed"]).inc();
+            RESOLVE_STORE_COUNTER_STATIC.failed.inc();
             self.report_unreachable(msg1);
         }
     }

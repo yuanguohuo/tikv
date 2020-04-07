@@ -4,18 +4,19 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use engine::rocks;
+use engine_rocks::{CloneCompat, RocksEngine};
 use kvproto::raft_serverpb::RaftMessage;
+use raftstore::coprocessor::CoprocessorHost;
+use raftstore::store::config::{Config, RaftstoreConfigManager};
+use raftstore::store::fsm::StoreMeta;
+use raftstore::store::fsm::*;
+use raftstore::store::{SnapManager, StoreMsg, Transport};
+use raftstore::Result;
 use tikv::config::{ConfigController, ConfigHandler, Module, TiKvConfig};
 use tikv::import::SSTImporter;
-use tikv::raftstore::coprocessor::CoprocessorHost;
-use tikv::raftstore::store::config::{Config, RaftstoreConfigManager};
-use tikv::raftstore::store::fsm::StoreMeta;
-use tikv::raftstore::store::fsm::*;
-use tikv::raftstore::store::{SnapManager, StoreMsg, Transport};
-use tikv::raftstore::Result;
 
 use engine::Engines;
-use engine::ALL_CFS;
+use engine_traits::ALL_CFS;
 use pd_client::ConfigClient;
 use pd_client::PdClient;
 use tempfile::{Builder, TempDir};
@@ -58,7 +59,12 @@ fn create_tmp_engine(path: &str) -> (TempDir, Engines) {
 
 fn start_raftstore(
     cfg: TiKvConfig,
-) -> (ConfigController, RaftRouter, ApplyRouter, RaftBatchSystem) {
+) -> (
+    ConfigController,
+    RaftRouter<RocksEngine>,
+    ApplyRouter,
+    RaftBatchSystem,
+) {
     let (raft_router, mut system) = create_raft_batch_system(&cfg.raft_store);
     let (_, engines) = create_tmp_engine("store-config");
     let host = CoprocessorHost::default();
@@ -72,20 +78,24 @@ fn start_raftstore(
     };
     let store_meta = Arc::new(Mutex::new(StoreMeta::new(0)));
     let cfg_track = Arc::new(VersionTrack::new(cfg.raft_store.clone()));
-    let mut cfg_controller = ConfigController::new(cfg, Default::default());
+    let mut cfg_controller = ConfigController::new(cfg.clone(), Default::default(), false);
     cfg_controller.register(
         Module::Raftstore,
         Box::new(RaftstoreConfigManager(cfg_track.clone())),
     );
     let pd_worker = FutureWorker::new("store-config");
-    let config_client =
-        ConfigHandler::start(String::new(), Default::default(), pd_worker.scheduler()).unwrap();
+    let config_client = ConfigHandler::start(
+        String::new(),
+        ConfigController::new(cfg, Default::default(), false),
+        pd_worker.scheduler(),
+    )
+    .unwrap();
 
     system
         .spawn(
             Default::default(),
             cfg_track,
-            engines,
+            engines.c(),
             MockTransport,
             Arc::new(MockPdClient),
             snap_mgr,
@@ -100,7 +110,7 @@ fn start_raftstore(
     (cfg_controller, raft_router, system.apply_router(), system)
 }
 
-fn validate_store<F>(router: &RaftRouter, f: F)
+fn validate_store<F>(router: &RaftRouter<RocksEngine>, f: F)
 where
     F: FnOnce(&Config) + Send + 'static,
 {
@@ -135,6 +145,7 @@ where
 #[test]
 fn test_update_raftstore_config() {
     let mut config = TiKvConfig::default();
+    config.enable_dynamic_config = false;
     config.validate().unwrap();
     let (mut cfg_controller, router, _, mut system) = start_raftstore(config.clone());
 
@@ -168,6 +179,7 @@ fn test_update_raftstore_config() {
 #[test]
 fn test_update_apply_store_config() {
     let mut config = TiKvConfig::default();
+    config.enable_dynamic_config = false;
     config.raft_store.sync_log = true;
     config.validate().unwrap();
     let (mut cfg_controller, raft_router, apply_router, mut system) =
