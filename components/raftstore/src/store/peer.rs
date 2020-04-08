@@ -2735,10 +2735,15 @@ impl RequestInspector for Peer {
     fn inspect_lease(&mut self) -> LeaseState {
         //Yuanguo: in_lease() == true indicates that this peer is definitely a leader (Role==Leader
         // and check_quorum is enabled)
+        //Yuanguo: self.raft_group.raft.in_lease() returns true indicates that this peer is
+        //  definitely a leader (Role == Leader and check_quorum is enabled)
+        //Yuanguo: well, not so definitely ... See raft-rs, MsgCheckQuorum is sent when
+        //  election_elapsed >= election_timeout, there is a chance that new leader gets
+        //  elected;
         if !self.raft_group.raft.in_lease() {
             return LeaseState::Suspect;
         }
-        //Yuanguo: we are sure this peer is a leader now, why do we need self.leader_lease below?
+        //Yuanguo: we are still not sure this peer is a leader, so check leader_lease...
         // None means now.
         let state = self.leader_lease.inspect(None);
         if LeaseState::Expired == state {
