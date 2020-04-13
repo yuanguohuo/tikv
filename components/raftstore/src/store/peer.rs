@@ -1673,6 +1673,8 @@ impl Peer {
     /// Propose a request.
     ///
     /// Return true means the request has been proposed successfully.
+    // Yuanguo: although named "propose", this func does not necessarily to propose to raft,
+    // e.g. a request can be serviced by Policy::ReadLocal;
     pub fn propose<T: Transport, C>(
         &mut self,
         ctx: &mut PollContext<T, C>,
@@ -1688,6 +1690,10 @@ impl Peer {
 
         let mut is_conf_change = false;
         let is_urgent = is_request_urgent(&req);
+
+        //Yuanguo: there's a command type named 'ReadIndex' (CmdType::ReadIndex) and there's a
+        // RequestPolicy named 'ReadIndex' (RequestPolicy::ReadIndex), a ReadIndex command may be
+        // serviced by RequestPolicy::ReadLocal or RequestPolicy::ReadIndex ...
 
         let policy = self.inspect(&req);
         let res = match policy {

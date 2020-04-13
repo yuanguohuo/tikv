@@ -283,6 +283,8 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
     pub fn handle_msgs(&mut self, msgs: &mut Vec<PeerMsg<RocksEngine>>) {
         for m in msgs.drain(..) {
             match m {
+                //Yuanguo: for a follower, process messages from leader, one key thing to do is
+                // self.fsm.peer.step();
                 PeerMsg::RaftMessage(msg) => {
                     if let Err(e) = self.on_raft_message(msg) {
                         error!(
@@ -293,6 +295,10 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
                         );
                     }
                 }
+                //Yuanguo: for both leader and follower (mainly leader), process commands from client,
+                // one key thing to do is self.fsm.peer.propose(); although named "propose", this func
+                // does not necessarily to propose to raft, e.g. a request can be serviced by Policy::
+                // ReadLocal.
                 PeerMsg::RaftCommand(cmd) => {
                     self.ctx
                         .raft_metrics
@@ -301,7 +307,11 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
                         .observe(duration_to_sec(cmd.send_time.elapsed()) as f64);
                     self.propose_raft_command(cmd.request, cmd.callback)
                 }
+                //Yuanguo: for both leader and follower, all kinds of ticks one of which is the raft
+                // base tick;
                 PeerMsg::Tick(tick) => self.on_tick(tick),
+                //Yuanguo: for both leader and follower, the apply result sent from ApplyBatchSystem;
+                //  one important thing is to call raft_group.advance_apply();
                 PeerMsg::ApplyRes { res } => {
                     self.on_apply_res(res);
                 }
@@ -2341,6 +2351,10 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
     }
 
     fn propose_raft_command(&mut self, mut msg: RaftCmdRequest, cb: Callback<RocksEngine>) {
+        //Yuanguo: in pre_propose_raft_command():
+        //   1. do some check;
+        //   2. handle status commands, which don't need raft group thus can be handled directly, such as:
+        //      get region leader or region details;
         match self.pre_propose_raft_command(&msg) {
             Ok(Some(resp)) => {
                 cb.invoke_with_response(resp);
@@ -2385,6 +2399,10 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
         let mut resp = RaftCmdResponse::default();
         let term = self.fsm.peer.term();
         bind_term(&mut resp, term);
+        // Yuanguo: although named "propose", this func does not necessarily to propose to raft,
+        // e.g. a request can be serviced by Policy::ReadLocal. return value:
+        //     true: successfully proposed;
+        //     false: not proposed or propose failed;
         if self.fsm.peer.propose(self.ctx, cb, msg, resp) {
             self.fsm.has_ready = true;
         }
