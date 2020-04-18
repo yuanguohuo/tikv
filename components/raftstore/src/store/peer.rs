@@ -2103,6 +2103,9 @@ impl Peer {
 
         self.bcast_wake_up_time = None;
         let id = Uuid::new_v4();
+
+        //Yuanguo: get the current 'committed index' (read index); which will be returned by
+        // Ready.read_states in an asynchronous way; this is actually 'propose';
         self.raft_group.read_index(id.as_bytes().to_vec());
 
         let pending_read_count = self.raft_group.raft.pending_read_count();

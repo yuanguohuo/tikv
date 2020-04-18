@@ -77,6 +77,26 @@ pub struct ReadIndexQueue {
     retry_countdown: usize,
 }
 
+//Yuanguo:
+//                                front  <---------------- len(reads)=12 ------------------------------->  back
+//                                  +-----+-----+-----+-----+-----+-----+-----+-----+-----+-----+-----+-----+
+//  | ............................. | 100 | 101 | 102 | 103 | 104 | 105 | 106 | 107 | 108 | 109 | 110 | 111 |
+//                                  +-----+-----+-----+-----+-----+-----+-----+-----+-----+-----+-----+-----+
+//  ^                                  ^                                         ^                       ^
+//  |                                  |                                         |                       |
+//  |                                reads[0]                                  reads[7]               reads[11]
+//  |                                  |                                         |                       |
+//  |<-------handled_cnt=100---------->|<--------------ready_cnt=8-------------->|<------unresolved----->|
+//  |                                  |                                         |                       |
+//  |                                  |                                         |                       |
+//offset=0                         offset=100                                offset=107                offset=111
+//                                     ^                                          ^
+//                                     |                                          |
+//                                handled_pos                                 ready_pos
+//
+// the ready requests   :  from reads[0] to reads[ready_cnt-1] (inclusive), have got the 'read_index'
+// the handled requests :  have finished and responsed to client (and thus have been removed from self.reads)
+
 impl ReadIndexQueue {
     /// Check it's necessary to retry pending read requests or not.
     /// Return true if all such conditions are satisfied:
@@ -160,6 +180,7 @@ impl ReadIndexQueue {
         None
     }
 
+    //Yuanguo: for leader, advance the ready_pos;
     pub fn advance_leader_reads<T>(&mut self, states: T)
     where
         T: IntoIterator<Item = (Uuid, u64)>,
@@ -171,6 +192,8 @@ impl ReadIndexQueue {
         }
     }
 
+    //Yuanguo: same as advance_leader_reads() above, but for replica (not leader), the states may
+    // be not continuous, so a map (self.contexts) is used to find the next request;
     /// update the read index of the requests that before the specified id.
     pub fn advance_replica_reads<T>(&mut self, states: T)
     where
@@ -244,6 +267,7 @@ impl ReadIndexQueue {
         }
     }
 
+    //Yuanguo: pop a ready request if there is any; that is to advance the handled_pos;
     pub fn pop_front(&mut self) -> Option<ReadIndexRequest> {
         if self.ready_cnt == 0 {
             return None;
@@ -261,6 +285,7 @@ impl ReadIndexQueue {
         Some(res)
     }
 
+    //Yuanguo: backward the handled_pos;
     /// Raft could have not been ready to handle the poped task. So put it back into the queue.
     pub fn push_front(&mut self, read: ReadIndexRequest) {
         debug_assert!(read.read_index.is_some());

@@ -283,8 +283,7 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
     pub fn handle_msgs(&mut self, msgs: &mut Vec<PeerMsg<RocksEngine>>) {
         for m in msgs.drain(..) {
             match m {
-                //Yuanguo: for a follower, process messages from leader, one key thing to do is
-                // self.fsm.peer.step();
+                //Yuanguo: messages from peer, one key thing to do is self.fsm.peer.step();
                 PeerMsg::RaftMessage(msg) => {
                     if let Err(e) = self.on_raft_message(msg) {
                         error!(
