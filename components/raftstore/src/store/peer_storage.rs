@@ -1215,6 +1215,23 @@ impl PeerStorage {
         } else {
             fail_point!("raft_before_apply_snap");
             let (kv_wb, raft_wb) = ready_ctx.wb_mut();
+            //Yuanguo:
+            //   1. clear kv_wb and raft_wb;
+            //   2. write "region state" in  kv_wb;
+            //           region state: to get all region ids in local store, you can scan the region state.
+            //           	column-family: "raft"
+            //           	key:
+            //           		start_key=0x01,0x03
+            //           		end_key=0x01,0x04
+            //
+            //           		0x01,0x03,   {region_id},   0x01
+            //           		---------    -----------    ------
+            //           		2B prefix        8B         1B region state suffix
+            //           	    0x03:region-meta
+            //           	val: state
+            //           		Applying    //applying a snapshot
+            //   3. populate ctx with info contained in snap: last index, term ...
+            //Yuanguo: where is the real snap data (rocksdb checkpoint)?
             self.apply_snapshot(&mut ctx, ready.snapshot(), kv_wb, raft_wb)?;
             fail_point!("raft_after_apply_snap");
 
@@ -1225,6 +1242,15 @@ impl PeerStorage {
             ready_ctx.set_sync_log(true);
         }
 
+        //Yuanguo: write entries (raft log to append) to ready_ctx.raft_kv (maybe discard original logs)
+        //  raft log
+        //	 column-family: "default"
+        //	 key:
+        //		0x01,0x02,   {region_id}  {0x01}  		       {log-index}
+        //		----------   -----------  ------               -----------
+        //		2B prefix		8B	     1B raft log suffix       8B
+        //		0x02:region-raft
+        //	 val: entry
         if !ready.entries().is_empty() {
             self.append(&mut ctx, ready.entries(), ready_ctx)?;
         }
@@ -1239,6 +1265,15 @@ impl PeerStorage {
 
         // Save raft state if it has changed or peer has applied a snapshot.
         if ctx.raft_state != self.raft_state || snapshot_index != 0 {
+            //Yuanguo:
+            //  raft state:
+            //	    column-family: "default"
+            //	    key:
+            //		    0x01,0x02,   {region_id} ,  0x02
+            //	    	----------   -----------    -----
+            //	    	2B prefix		8B	        1B raft state suffix
+            //	    	0x02:region-raft
+            //      val: raft state (hard state, term, index ...)
             ctx.save_raft_state_to(ready_ctx.raft_wb_mut())?;
             if snapshot_index > 0 {
                 // in case of restart happen when we just write region state to Applying,
