@@ -13,9 +13,8 @@ use futures_util::io::AsyncReadExt;
 use grpcio::{ChannelBuilder, Environment};
 
 use backup::Task;
-use engine::*;
 use engine_traits::IterOptions;
-use engine_traits::{CfName, CF_DEFAULT, CF_WRITE};
+use engine_traits::{CfName, CF_DEFAULT, CF_WRITE, DATA_KEY_PREFIX_LEN};
 use external_storage::*;
 use kvproto::backup::*;
 use kvproto::import_sstpb::*;
@@ -26,6 +25,7 @@ use tempfile::Builder;
 use test_raftstore::*;
 use tidb_query_common::storage::scanner::{RangesScanner, RangesScannerOptions};
 use tidb_query_common::storage::{IntervalRange, Range};
+use tikv::config::BackupConfig;
 use tikv::coprocessor::checksum_crc64_xor;
 use tikv::coprocessor::dag::TiKVStorage;
 use tikv::storage::kv::Engine;
@@ -81,7 +81,8 @@ impl TestSuite {
                 *id,
                 sim.storages[&id].clone(),
                 sim.region_info_accessors[&id].clone(),
-                engines.kv.clone(),
+                engines.kv.as_inner().clone(),
+                BackupConfig { num_threads: 4 },
             );
             let mut worker = Worker::new(format!("backup-{}", id));
             worker.start(backup_endpoint).unwrap();
@@ -253,9 +254,10 @@ impl TestSuite {
             IsolationLevel::Si,
             false,
             Default::default(),
+            false,
         );
         let mut scanner = RangesScanner::new(RangesScannerOptions {
-            storage: TiKVStorage::from(snap_store),
+            storage: TiKVStorage::new(snap_store, false),
             ranges: vec![Range::Interval(IntervalRange::from((start, end)))],
             scan_backward_in_range: false,
             is_key_only: false,

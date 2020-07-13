@@ -29,6 +29,7 @@ pub struct ExecutorsRunner<SS> {
 /// Builds a normal executor pipeline.
 ///
 /// Normal executors iterate rows one by one.
+#[allow(clippy::explicit_counter_loop)]
 pub fn build_executors<S: Storage + 'static, C: ExecSummaryCollector + 'static>(
     exec_descriptors: Vec<tipb::Executor>,
     storage: S,
@@ -49,7 +50,7 @@ pub fn build_executors<S: Storage + 'static, C: ExecSummaryCollector + 'static>(
 
         let curr: Box<dyn Executor<StorageStats = S::Statistics> + Send> = match exec.get_tp() {
             ExecType::TypeSelection => {
-                EXECUTOR_COUNT_METRICS.with(|m| m.selection.inc());
+                EXECUTOR_COUNT_METRICS.selection.inc();
 
                 Box::new(
                     super::SelectionExecutor::new(exec.take_selection(), Arc::clone(&ctx), src)?
@@ -57,7 +58,7 @@ pub fn build_executors<S: Storage + 'static, C: ExecSummaryCollector + 'static>(
                 )
             }
             ExecType::TypeAggregation => {
-                EXECUTOR_COUNT_METRICS.with(|m| m.hash_aggr.inc());
+                EXECUTOR_COUNT_METRICS.hash_aggr.inc();
 
                 Box::new(
                     super::HashAggExecutor::new(exec.take_aggregation(), Arc::clone(&ctx), src)?
@@ -65,7 +66,7 @@ pub fn build_executors<S: Storage + 'static, C: ExecSummaryCollector + 'static>(
                 )
             }
             ExecType::TypeStreamAgg => {
-                EXECUTOR_COUNT_METRICS.with(|m| m.stream_aggr.inc());
+                EXECUTOR_COUNT_METRICS.stream_aggr.inc();
 
                 Box::new(
                     super::StreamAggExecutor::new(Arc::clone(&ctx), src, exec.take_aggregation())?
@@ -73,7 +74,7 @@ pub fn build_executors<S: Storage + 'static, C: ExecSummaryCollector + 'static>(
                 )
             }
             ExecType::TypeTopN => {
-                EXECUTOR_COUNT_METRICS.with(|m| m.top_n.inc());
+                EXECUTOR_COUNT_METRICS.top_n.inc();
 
                 Box::new(
                     super::TopNExecutor::new(exec.take_top_n(), Arc::clone(&ctx), src)?
@@ -81,7 +82,7 @@ pub fn build_executors<S: Storage + 'static, C: ExecSummaryCollector + 'static>(
                 )
             }
             ExecType::TypeLimit => {
-                EXECUTOR_COUNT_METRICS.with(|m| m.limit.inc());
+                EXECUTOR_COUNT_METRICS.limit.inc();
 
                 Box::new(
                     super::LimitExecutor::new(exec.take_limit(), src)
@@ -97,8 +98,6 @@ pub fn build_executors<S: Storage + 'static, C: ExecSummaryCollector + 'static>(
         };
         src = curr;
     }
-
-    EXECUTOR_COUNT_METRICS.with(|m| m.may_flush_all());
 
     Ok(src)
 }
@@ -117,7 +116,7 @@ fn build_first_executor<S: Storage + 'static, C: ExecSummaryCollector + 'static>
     let context = EvalContext::new(context);
     match first.get_tp() {
         ExecType::TypeTableScan => {
-            EXECUTOR_COUNT_METRICS.with(|m| m.table_scan.inc());
+            EXECUTOR_COUNT_METRICS.table_scan.inc();
 
             let ex = Box::new(
                 super::ScanExecutor::table_scan(
@@ -132,7 +131,7 @@ fn build_first_executor<S: Storage + 'static, C: ExecSummaryCollector + 'static>
             Ok(ex)
         }
         ExecType::TypeIndexScan => {
-            EXECUTOR_COUNT_METRICS.with(|m| m.index_scan.inc());
+            EXECUTOR_COUNT_METRICS.index_scan.inc();
 
             let unique = first.get_idx_scan().get_unique();
             let ex = Box::new(
@@ -313,9 +312,15 @@ impl<SS: 'static> ExecutorsRunner<SS> {
         Ok((None, true))
     }
 
+    #[inline]
     pub fn collect_storage_stats(&mut self, dest: &mut SS) {
         // TODO: A better way is to fill storage stats in `handle_request`, or
         // return SelectResponse in `handle_request`.
         self.executor.collect_storage_stats(dest);
+    }
+
+    #[inline]
+    pub fn can_be_cached(&self) -> bool {
+        self.executor.can_be_cached()
     }
 }

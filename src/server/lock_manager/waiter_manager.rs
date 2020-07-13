@@ -487,22 +487,14 @@ impl WaiterManager {
         let detector_scheduler = self.detector_scheduler.clone();
         // Remove the waiter from wait table when it times out.
         let f = waiter.on_timeout(move || {
-            wait_table
-                .borrow_mut()
-                .remove_waiter(lock, waiter_ts)
-                .and_then(|waiter| {
-                    detector_scheduler.clean_up_wait_for(waiter.start_ts, waiter.lock);
-                    waiter.notify();
-                    Some(())
-                });
+            if let Some(waiter) = wait_table.borrow_mut().remove_waiter(lock, waiter_ts) {
+                detector_scheduler.clean_up_wait_for(waiter.start_ts, waiter.lock);
+                waiter.notify();
+            }
         });
-        self.wait_table
-            .borrow_mut()
-            .add_waiter(waiter)
-            .and_then(|old| {
-                old.notify();
-                Some(())
-            });
+        if let Some(old) = self.wait_table.borrow_mut().add_waiter(waiter) {
+            old.notify();
+        };
         handle.spawn(f);
     }
 
@@ -543,14 +535,10 @@ impl WaiterManager {
     }
 
     fn handle_deadlock(&mut self, waiter_ts: TimeStamp, lock: Lock, deadlock_key_hash: u64) {
-        self.wait_table
-            .borrow_mut()
-            .remove_waiter(lock, waiter_ts)
-            .and_then(|mut waiter| {
-                waiter.deadlock_with(deadlock_key_hash);
-                waiter.notify();
-                Some(())
-            });
+        if let Some(mut waiter) = self.wait_table.borrow_mut().remove_waiter(lock, waiter_ts) {
+            waiter.deadlock_with(deadlock_key_hash);
+            waiter.notify();
+        }
     }
 
     fn handle_config_change(
@@ -584,10 +572,7 @@ impl FutureRunnable<Task> for WaiterManager {
             } => {
                 let waiter = Waiter::new(start_ts, cb, pr, lock, self.normalize_deadline(timeout));
                 self.handle_wait_for(handle, waiter);
-                TASK_COUNTER_METRICS.with(|m| {
-                    m.wait_for.inc();
-                    m.may_flush_all()
-                });
+                TASK_COUNTER_METRICS.wait_for.inc();
             }
             Task::WakeUp {
                 lock_ts,
@@ -595,17 +580,11 @@ impl FutureRunnable<Task> for WaiterManager {
                 commit_ts,
             } => {
                 self.handle_wake_up(lock_ts, hashes, commit_ts);
-                TASK_COUNTER_METRICS.with(|m| {
-                    m.wake_up.inc();
-                    m.may_flush_all()
-                });
+                TASK_COUNTER_METRICS.wake_up.inc();
             }
             Task::Dump { cb } => {
                 self.handle_dump(cb);
-                TASK_COUNTER_METRICS.with(|m| {
-                    m.dump.inc();
-                    m.may_flush_all()
-                });
+                TASK_COUNTER_METRICS.dump.inc();
             }
             Task::Deadlock {
                 start_ts,
