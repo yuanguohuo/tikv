@@ -654,6 +654,9 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm<RocksSnapshot>, StoreFsm> fo
         self.timer = TiInstant::now_coarse();
         // update config
         self.poll_ctx.perf_context_statistics.start();
+
+        //Yuanguo: if config item "messages_per_tick" was changed, now adjust the message buffers
+        // accordingly;
         if let Some(incoming) = self.cfg_tracker.any_new() {
             match Ord::cmp(
                 &incoming.messages_per_tick,

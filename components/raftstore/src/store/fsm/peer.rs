@@ -2906,7 +2906,7 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
         bind_term(&mut resp, term);
         // Yuanguo: although named "propose", this func does not necessarily to propose to raft,
         // e.g. a request can be serviced by Policy::ReadLocal. return value:
-        //     true: successfully proposed;
+        //     true: need to propose and propose successfully ;
         //     false: not proposed or propose failed;
         if self.fsm.peer.propose(self.ctx, cb, msg, resp, txn_extra) {
             self.fsm.has_ready = true;

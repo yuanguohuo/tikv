@@ -2974,6 +2974,8 @@ pub trait RequestInspector {
             return Ok(RequestPolicy::ProposeNormal);
         }
 
+        //Yuanguo: the request needs quorum, so we must go with ReadIndex; before ReadIndex was implemented,
+        // it must be serviced by propose;
         if req.get_header().get_read_quorum() {
             return Ok(RequestPolicy::ReadIndex);
         }
@@ -3002,18 +3004,38 @@ impl RequestInspector for Peer {
     }
 
     fn inspect_lease(&mut self) -> LeaseState {
-        //Yuanguo: in_lease() == true indicates that this peer is definitely a leader (Role==Leader
-        // and check_quorum is enabled)
-        //Yuanguo: self.raft_group.raft.in_lease() returns true indicates that this peer is
-        //  definitely a leader (Role == Leader and check_quorum is enabled)
-        //Yuanguo: well, not so definitely ... See raft-rs, MsgCheckQuorum is sent when
-        //  election_elapsed >= election_timeout, there is a chance that new leader gets
-        //  elected;
+        // Yuanguo: raft_group.raft.in_lease() returns true if check_quorum is enabled and role is Leader;
+        // this is the leader-lease implemented in Raft it works like this: when check_quorum is enabled for
+        // a leader, in every tick
+        //    a. election_elapsed += 1;
+        //    b. if election_elapsed >= election_timeout, send MsgCheckQuorum (it's a local message);
+        //    c. when handling local message MsgCheckQuorum in step_leader, the leader:
+        //           1. call check_quorum_active(): count how many peers have recent_active=true and
+        //              reset them to false; return true if count reaches quorum or false otherwise;
+        //              (recent_active is set to true for a peer when it responses a MsgHeartBeat or
+        //              MsgAppend)
+        //           2. if false, step to follower;
+        //
+        // That's the leader-lease implemented in Raft (raft-rs), where "in lease" means enough peers (quorum) have
+        // responded MsgHeartBeat or MsgAppend in election_timeout (election_timeout is what "recent" refers to); note
+        // each peer's randomized election timeout >= election_timeout, so we're sure there's no new leader (if there's
+        // no clock drift);
+        //
+        // LeaseState::Suspect is returned if Raft is not "in lease", that's fine, but why we need additional check when
+        // Raft is "in lease"? The answer is clock drift. see https://github.com/tikv/tikv/pull/1127/files ;
+        // My understanding is, Raft leader-lease doesn't take clock drift into account, for example:
+        //      election_timeout = 10;
+        //      follower-1's randomized_election_timeout = 11;
+        //      follower-2's randomized_election_timeout = 12;
+        // A. if leader's clock runs faster: in a period of real time, leader ticks 10 times and both followers tick
+        //    tick 9 times; it's fine because if leader is in lease, the followers didn't start election for sure;
+        // B. if leader's clock runs slower: in a period of real time, leader ticks 10 times but both followers tick
+        //    tick 11 times each; then follower-1 may have started an election, become a leader and served proposals,
+        //    even if the original leader is still in lease
+
         if !self.raft_group.raft.in_lease() {
             return LeaseState::Suspect;
         }
-        //Yuanguo: we are still not sure this peer is a leader, so check leader_lease...
-        // None means now.
         let state = self.leader_lease.inspect(None);
         if LeaseState::Expired == state {
             debug!(
